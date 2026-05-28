@@ -1,44 +1,187 @@
 # pi-subagents
 
-Configurable sync and async subagents for [Pi](https://pi.dev).
+Configurable sync and async sub Pi agents for [Pi](https://pi.dev).
 
-`pi-subagents` gives your primary agent a small set of delegation tools with isolated context windows:
+`pi-subagents` gives the orchestrating agent one core primitive:
 
-- `consult` — synchronous no-tool reasoning helper
-- `explore` — synchronous read-only codebase explorer
-- `consult_async` — background reasoning helper; result arrives later
-- `explore_async` — background read-only explorer; result arrives later
+> Run a fresh Pi subagent with this role, this task, this cwd, this model preset, and this tool policy.
+
+It exposes:
+
+- `subagent` — run one bespoke sub Pi agent synchronously
+- `subagents_async` — launch one or more bespoke sub Pi agents in the background
 - `subagent_status` — inspect async jobs
 - `subagent_cancel` — cancel a running async job
 - `/subagents-config` — inspect resolved config
 
-Subagents have **no memory** of the parent conversation. Every call must include the context needed to answer the question.
+Subagents have **no memory** of the parent conversation. Every task must include the context needed to do the job.
 
 ---
 
 ## Why use this?
 
-Primary coding agents are good at steering work, but broad reconnaissance and side reasoning can pollute the parent context. Subagents let the primary agent offload scoped work into fresh contexts and receive a compact answer back.
+Primary coding agents are good orchestrators, but broad reconnaissance and parallel review can pollute the parent context. Subagents let the primary agent delegate scoped jobs into fresh contexts and receive compact answers back.
 
 Good uses:
 
-- map an unfamiliar part of a repo before editing
-- ask for independent review of a design or code snippet
-- run multiple independent investigations in the background
+- review several repos in parallel from a parent workspace directory
+- map unfamiliar code before editing
+- ask for independent role-based review, e.g. backend reviewer, frontend reviewer, migration reviewer
+- run independent investigations in the background
 - keep parent-session context focused on decisions and edits
 
 Bad uses:
 
 - making file changes
 - running commands/tests that require bash
-- anything that needs parent-session memory but was not included in the prompt
 - async work whose result is required before the next step
+- tasks that rely on parent-session memory but do not include the needed context
+
+---
+
+## Tools
+
+## `subagent(role, task, cwd?, model, tools)`
+
+Run one fresh sub Pi agent synchronously. Use when the next parent-agent step depends on the result.
+
+Arguments:
+
+| Field | Required | Meaning |
+|---|---:|---|
+| `role` | yes | Bespoke role/job framing for this subagent |
+| `task` | yes | Self-contained task and all context needed |
+| `cwd` | no | Working directory for `read_only` subagents; defaults to parent cwd |
+| `model` | yes | Fixed model preset: `fast`, `smart`, or `coder` |
+| `tools` | yes | Tool policy: `none` or `read_only` |
+
+Example:
+
+```text
+subagent(
+  role="You are a staff backend reviewer focused on API compatibility and database safety.",
+  task="Review this repo's current change for correctness risks, missing tests, and integration concerns. Cite files.",
+  cwd="./payroll-api",
+  model="coder",
+  tools="read_only"
+)
+```
+
+---
+
+## `subagents_async(tasks, deliver?)`
+
+Launch one or more fresh sub Pi agents in the background. Use for independent work that can run while the parent agent continues.
+
+Arguments:
+
+| Field | Required | Meaning |
+|---|---:|---|
+| `tasks` | yes | Array of subagent tasks |
+| `deliver` | no | `followUp` or `steer`; defaults from config |
+
+Each task has:
+
+| Field | Required | Meaning |
+|---|---:|---|
+| `tag` | no, recommended | Stable async job id, e.g. `payroll-pr-review` |
+| `role` | yes | Bespoke role/job framing |
+| `task` | yes | Self-contained task |
+| `cwd` | no | Working directory for `read_only` subagents |
+| `model` | yes | `fast`, `smart`, or `coder` |
+| `tools` | yes | `none` or `read_only` |
+
+Example: review three repos from a parent workspace directory:
+
+```text
+subagents_async(
+  tasks=[
+    {
+      tag="payroll-pr-review",
+      cwd="./payroll-api",
+      model="coder",
+      tools="read_only",
+      role="You are a staff backend engineer reviewing a payroll service PR.",
+      task="Review this repo's current change for correctness risks, edge cases, missing tests, and integration issues. Cite files."
+    },
+    {
+      tag="benefits-pr-review",
+      cwd="./benefits-api",
+      model="coder",
+      tools="read_only",
+      role="You are a staff backend engineer reviewing a benefits service PR.",
+      task="Review this repo's current change for data consistency, API compatibility, migration risk, and missing tests. Cite files."
+    },
+    {
+      tag="employee-web-pr-review",
+      cwd="./employee-web",
+      model="coder",
+      tools="read_only",
+      role="You are a senior frontend engineer reviewing a web app PR.",
+      task="Review this repo's current change for UI regressions, state bugs, component misuse, and missing tests. Cite files."
+    }
+  ],
+  deliver="followUp"
+)
+```
+
+Each result later arrives as a tagged user message:
+
+```md
+Subagent result #payroll-pr-review completed.
+
+Model preset: coder
+Tool policy: read_only
+CWD: /Users/you/dev/workspace/payroll-api
+...
+
+Result:
+...
+```
+
+---
+
+## `subagent_status(tag?)`
+
+Check async job status.
+
+Examples:
+
+```text
+subagent_status()
+subagent_status(tag="payroll-pr-review")
+```
+
+---
+
+## `subagent_cancel(tag)`
+
+Cancel a running async job.
+
+Example:
+
+```text
+subagent_cancel(tag="payroll-pr-review")
+```
+
+---
+
+## Tool policies
+
+Subagents require an explicit tool policy.
+
+| Policy | Tools | Use |
+|---|---|---|
+| `none` | no tools | Reasoning over context included in the task |
+| `read_only` | `read`, `grep`, `find`, `ls` | Codebase inspection without mutation |
+
+`read_only` subagents cannot run bash. For PR review, either ask them to inspect files directly or have the parent agent provide diffs in the task. A future policy may add constrained read-only git tools.
 
 ---
 
 ## Fixed model presets
 
-The tool API uses three fixed semantic model presets:
+The API uses three fixed semantic model presets:
 
 | Preset | Meaning | Typical backing model |
 |---|---|---|
@@ -48,7 +191,7 @@ The tool API uses three fixed semantic model presets:
 
 The preset names are intentionally fixed. The backing provider/model IDs are configurable.
 
-Every subagent tool call requires an explicit `model` value. There is no default.
+Every subagent task requires an explicit `model`. There is no default.
 
 ---
 
@@ -150,7 +293,7 @@ to see the resolved config and model mapping.
 
 `pi-subagents` does **not** register model providers. It consumes whatever providers/models are already available in Pi's model registry.
 
-That means each configured provider/model pair must be available through one of:
+Each configured provider/model pair must be available through one of:
 
 - a built-in Pi provider, configured via API key or `/login`
 - a provider extension package, such as a LiteLLM provider extension
@@ -188,150 +331,13 @@ If the provider/model is not registered, subagent calls fail with a clear error:
 subagents: configured model litellm/foo for preset smart is not registered.
 ```
 
-Use `pi --list-models`, `/model`, or your provider extension docs to confirm the provider/model IDs before putting them in `subagents.json`.
-
----
-
-## Tools
-
-## `consult(question, context?, model)`
-
-Ask a no-tool reasoning subagent a self-contained question. The subagent cannot read files or run commands.
-
-Use for:
-
-- architecture trade-offs
-- code review of snippets you paste in
-- reasoning over an error message
-- asking for an independent opinion after you provide context
-
-Example:
-
-```text
-consult(
-  question="What race conditions do you see in this function?",
-  context="<paste the relevant function and caller>",
-  model="coder"
-)
-```
-
-The answer is returned synchronously to the primary agent.
-
----
-
-## `explore(question, cwd?, model)`
-
-Ask a read-only codebase explorer a self-contained question. The subagent gets these tools only:
-
-- `read`
-- `grep`
-- `find`
-- `ls`
-
-It cannot run bash, edit files, write files, load extensions, load skills, or use parent-session memory.
-
-Use for:
-
-- locating implementation areas
-- summarizing existing architecture
-- finding tests or conventions
-- answering repo questions that would otherwise require many reads/greps
-
-Example:
-
-```text
-explore(
-  question="Find where authentication middleware is registered and summarize the request flow.",
-  cwd="/Users/you/dev/app",
-  model="smart"
-)
-```
-
-The answer is returned synchronously to the primary agent.
-
----
-
-## `consult_async(question, context?, model, tag?, deliver?)`
-
-Launch a no-tool reasoning subagent in the background and return immediately.
-
-Use only when the primary agent can continue without the answer.
-
-Example:
-
-```text
-consult_async(
-  question="Review this migration strategy for hidden risks.",
-  context="<paste plan>",
-  model="coder",
-  tag="migration-risk-review"
-)
-```
-
-When complete, the result is injected as a tagged user message:
-
-```md
-Subagent result #migration-risk-review completed.
-
-Kind: consult
-Model preset: coder
-...
-
-Result:
-...
-```
-
----
-
-## `explore_async(question, cwd?, model, tag?, deliver?)`
-
-Launch a read-only codebase explorer in the background and return immediately.
-
-Use for independent reconnaissance while the primary agent continues other work.
-
-Example:
-
-```text
-explore_async(
-  question="Map the API route structure and identify auth boundaries.",
-  cwd="/Users/you/dev/app",
-  model="fast",
-  tag="api-auth-map"
-)
-```
-
-When complete, the result is injected as a tagged user message.
-
----
-
-## `subagent_status(tag?)`
-
-Check async job status.
-
-Examples:
-
-```text
-subagent_status()
-subagent_status(tag="api-auth-map")
-```
-
----
-
-## `subagent_cancel(tag)`
-
-Cancel a running async job.
-
-Example:
-
-```text
-subagent_cancel(tag="api-auth-map")
-```
+Use `pi --list-models`, `/model`, or your provider extension docs to confirm provider/model IDs before putting them in `subagents.json`.
 
 ---
 
 ## Async delivery modes
 
-Async tools accept optional `deliver`:
+`subagents_async` accepts optional `deliver`:
 
 | Value | Behavior |
 |---|---|
@@ -352,12 +358,12 @@ Default comes from config:
 
 Pi tool calls are synchronous from the model's perspective. Async subagents are implemented as fire-and-forget background jobs:
 
-1. the launch tool starts a background task
-2. the launch tool immediately returns a job id
-3. the primary agent continues
-4. the background task later injects a tagged user message with the result
+1. the launch tool starts background tasks
+2. the launch tool immediately returns job ids
+3. the parent agent continues
+4. each background task later injects a tagged user message with its result
 
-This means the primary agent **cannot await an async result in the same reasoning chain**. Use sync `consult` or `explore` if the next step depends on the answer.
+The parent agent **cannot await an async result in the same reasoning chain**. Use sync `subagent` if the next step depends on the answer.
 
 ---
 
@@ -366,9 +372,10 @@ This means the primary agent **cannot await an async result in the same reasonin
 `pi-subagents` renders custom tool rows showing:
 
 - tool kind and model preset
+- tool policy
 - job id/tag for async calls
-- question preview
-- cwd for exploration
+- role and task preview
+- cwd
 - running/done/error status
 - elapsed time
 - token/cost summary
@@ -379,8 +386,8 @@ Async jobs also appear in a persistent widget while running and for recent compl
 
 ```text
 Subagents
-⏳ #api-auth-map explore fast 0:22 5 tools
-✓ #migration-risk-review consult coder 0:41 reasoning
+⏳ #payroll-pr-review coder read_only 0:22 5 tools
+✓ #migration-risk-review coder none 0:41 reasoning
 ```
 
 ---
@@ -390,23 +397,24 @@ Subagents
 Good parent-agent instructions:
 
 ```md
-Use subagents aggressively for independent work.
+Use `subagent`/`subagents_async` aggressively for scoped work.
 
-- Use `explore(..., model="smart")` when surveying unfamiliar code.
-- Use `explore(..., model="fast")` for cheap, narrow reconnaissance.
-- Use `consult(..., model="smart")` for general design/trade-off reasoning.
-- Use `consult(..., model="coder")` for code-heavy review, subtle bugs, or implementation analysis.
-- Use async variants only when the result does not block the next step.
-- Always include all context the subagent needs; subagents have no memory of this conversation.
+- Use `subagent` when the next step depends on the result.
+- Use `subagents_async` for independent parallel investigations or reviews.
+- Always provide a bespoke `role` and self-contained `task`.
+- Always choose `model`: `fast`, `smart`, or `coder`.
+- Always choose `tools`: `none` or `read_only`.
+- Use `fast` for cheap reconnaissance, `smart` for balanced exploration/reasoning, and `coder` for code-heavy review/debugging.
+- Use clear async tags when launching multiple subagents.
 ```
 
 ---
 
 ## Security model
 
-`consult` and `consult_async` are single no-tool model calls.
+`tools="none"` subagents are single no-tool model calls.
 
-`explore` and `explore_async` run isolated in-process Pi sessions with only read-only tools enabled:
+`tools="read_only"` subagents run isolated in-process Pi sessions with only read-only tools enabled:
 
 - no bash
 - no writes

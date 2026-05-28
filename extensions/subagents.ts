@@ -1,8 +1,7 @@
 /**
  * Pi Subagents Extension
  *
- * Configurable sync + async subagents with fixed semantic model presets:
- * fast, smart, coder.
+ * Runs fresh sub Pi agents with orchestrator-supplied role/task/cwd/model/tool policy.
  *
  * Config files (merged, project takes precedence):
  * - ~/.pi/agent/subagents.json
@@ -24,11 +23,12 @@ import { StringEnum, Type, complete, type Context } from "@earendil-works/pi-ai"
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 
 type SubagentModelPreset = "fast" | "smart" | "coder";
-type SubagentKind = "consult" | "explore";
+type SubagentToolPolicy = "none" | "read_only";
 type AsyncDelivery = "steer" | "followUp";
 type JobStatus = "running" | "done" | "error" | "aborted" | "cancelled";
 
 const MODEL_PRESETS = ["fast", "smart", "coder"] as const;
+const TOOL_POLICIES = ["none", "read_only"] as const;
 const DELIVERY_OPTIONS = ["steer", "followUp"] as const;
 const WIDGET_KEY = "pi-subagents";
 const DEFAULT_MAX_CONCURRENT_ASYNC = 4;
@@ -76,16 +76,19 @@ interface ToolCallSummary {
   args: Record<string, unknown>;
 }
 
-interface RunResult {
-  id?: string;
-  kind: SubagentKind;
-  execution: "sync" | "async";
-  question: string;
-  context?: string;
+interface SubagentInput {
+  role: string;
+  task: string;
   cwd?: string;
-  modelPreset: SubagentModelPreset;
+  model: SubagentModelPreset;
+  tools: SubagentToolPolicy;
+}
+
+interface RunResult extends SubagentInput {
+  id?: string;
+  execution: "sync" | "async";
   provider?: string;
-  model?: string;
+  modelId?: string;
   status: JobStatus;
   startedAt: number;
   endedAt?: number;
@@ -103,25 +106,27 @@ interface AsyncJob extends RunResult {
   deliver: AsyncDelivery;
 }
 
-const CONSULT_SYSTEM_PROMPT = `You are a reasoning helper spawned by another AI coding agent.
+function buildSystemPrompt(role: string, tools: SubagentToolPolicy): string {
+  const toolPolicy = tools === "none"
+    ? "You have no tools. Reason only from the task and any context included in it. If the task requires inspecting files that were not provided, say so plainly."
+    : "You have read, grep, find, and ls tools. Use them freely for read-only codebase inspection. You do not have bash, edit, or write tools.";
 
-You have NO memory of any prior conversation and NO tools to read files or run commands. Answer only from the information in the user's question and your own knowledge.
+  return `You are a subagent spawned by a primary AI coding agent.
 
-If the question requires inspecting files you don't have, say so plainly — don't guess. Suggest what the caller should look at themselves.
+Role:
+${role}
 
-Be concise. Prefer a few sentences or short bullets. Your answer goes directly back to the calling agent.`;
-
-const EXPLORE_SYSTEM_PROMPT = `You are a read-only codebase explorer spawned by another AI coding agent. Your job is to answer a single self-contained question about the codebase, then stop.
-
-You have read, grep, find, and ls tools — use them freely. You do NOT have bash, edit, or write. You have NO memory of any prior conversation — treat the question as standalone.
+Tool policy:
+${toolPolicy}
 
 Rules:
-- Be concise. Answer the exact question asked, with citations (file_path:line_number) when possible.
-- When you have enough to answer, stop calling tools and write the final answer.
-- If the question is unanswerable from the codebase, say so plainly — don't speculate.
-- No code changes, no suggestions for changes. Describe only what exists.
-
-Your answer goes directly back to the calling agent — no greetings, no preamble.`;
+- You have NO memory of the parent conversation. Treat the task as standalone.
+- Do exactly the assigned task, then stop.
+- Be concise and dense. Your answer goes directly back to the orchestrating agent.
+- If using repo evidence, cite files and line numbers when possible.
+- If the task is unanswerable with your tools/context, say so plainly — do not speculate.
+- Do not make code changes.`;
+}
 
 function expandHome(p: string): string {
   if (p === "~") return process.env.HOME || "/tmp";
@@ -235,10 +240,6 @@ function formatElapsed(ms: number): string {
   return `${min}:${rem.toString().padStart(2, "0")}`;
 }
 
-function firstText(content: Array<{ type: string; text?: string }>): string {
-  return content.find((c) => c.type === "text")?.text ?? "";
-}
-
 function getStatusIcon(status: JobStatus, theme: Theme): string {
   switch (status) {
     case "running": return theme.fg("warning", "⏳");
@@ -249,8 +250,8 @@ function getStatusIcon(status: JobStatus, theme: Theme): string {
   }
 }
 
-function summarizeQuestion(question: string, max = 90): string {
-  const compact = question.replace(/\s+/g, " ").trim();
+function summarize(value: string, max = 90): string {
+  const compact = value.replace(/\s+/g, " ").trim();
   return compact.length > max ? `${compact.slice(0, max - 1)}…` : compact;
 }
 
@@ -258,22 +259,8 @@ function modelGuidance(): string {
   return "Required model preset: fast for cheap quick reconnaissance, smart for balanced/default reasoning, coder for code-heavy analysis/review/debugging.";
 }
 
-function configErrorResult(kind: SubagentKind, execution: "sync" | "async", modelPreset: SubagentModelPreset, question: string, error: string) {
-  const result: RunResult = {
-    kind,
-    execution,
-    modelPreset,
-    question,
-    status: "error",
-    startedAt: Date.now(),
-    endedAt: Date.now(),
-    error,
-    tokensIn: 0,
-    tokensOut: 0,
-    costUsd: 0,
-    toolCalls: [],
-  };
-  return { content: [{ type: "text" as const, text: error }], details: result, isError: true };
+function toolsGuidance(): string {
+  return "Required tool policy: none for reasoning-only; read_only for a fresh Pi agent with read/grep/find/ls.";
 }
 
 async function resolveConfiguredModel(ctx: ExtensionContext, preset: SubagentModelPreset): Promise<{ ok: true; provider: string; modelId: string; model: any; apiKey?: string; headers?: Record<string, string> } | { ok: false; error: string }> {
@@ -289,14 +276,13 @@ async function resolveConfiguredModel(ctx: ExtensionContext, preset: SubagentMod
   return { ok: true, provider: selected.provider, modelId: selected.model, model, apiKey: auth.apiKey, headers: auth.headers };
 }
 
-async function runConsult(params: { question: string; context?: string; model: SubagentModelPreset }, signal: AbortSignal | undefined, ctx: ExtensionContext, onUpdate?: (partial: RunResult) => void): Promise<RunResult> {
+async function runSubagent(input: SubagentInput, execution: "sync" | "async", signal: AbortSignal | undefined, ctx: ExtensionContext, onUpdate?: (partial: RunResult) => void): Promise<RunResult> {
   const startedAt = Date.now();
+  const cwd = input.cwd ? expandHome(input.cwd) : ctx.cwd;
   const run: RunResult = {
-    kind: "consult",
-    execution: "sync",
-    question: params.question,
-    context: params.context,
-    modelPreset: params.model,
+    ...input,
+    cwd,
+    execution,
     status: "running",
     startedAt,
     tokensIn: 0,
@@ -306,71 +292,47 @@ async function runConsult(params: { question: string; context?: string; model: S
   };
   onUpdate?.(run);
 
-  const resolved = await resolveConfiguredModel(ctx, params.model);
+  const resolved = await resolveConfiguredModel(ctx, input.model);
   if (!resolved.ok) return { ...run, status: "error", endedAt: Date.now(), error: resolved.error };
   run.provider = resolved.provider;
-  run.model = resolved.modelId;
+  run.modelId = resolved.modelId;
   onUpdate?.(run);
 
-  const userText = params.context ? `Context:\n${params.context}\n\nQuestion: ${params.question}` : params.question;
-  const context: Context = {
-    systemPrompt: CONSULT_SYSTEM_PROMPT,
-    messages: [{ role: "user", content: userText, timestamp: Date.now() }],
-  };
-
-  try {
-    const result = await complete(resolved.model, context, {
-      signal,
-      apiKey: resolved.apiKey,
-      headers: resolved.headers,
-      maxTokens: 4096,
-    });
-
-    const answer = result.content
-      .filter((c): c is { type: "text"; text: string } => c.type === "text")
-      .map((c) => c.text)
-      .join("\n")
-      .trim() || "(subagent returned no text)";
-
-    return {
-      ...run,
-      status: result.stopReason === "aborted" ? "aborted" : "done",
-      endedAt: Date.now(),
-      answer,
-      tokensIn: result.usage.input,
-      tokensOut: result.usage.output,
-      costUsd: result.usage.cost.total,
-      error: result.stopReason === "aborted" ? "consult aborted" : undefined,
+  if (input.tools === "none") {
+    const context: Context = {
+      systemPrompt: buildSystemPrompt(input.role, input.tools),
+      messages: [{ role: "user", content: input.task, timestamp: Date.now() }],
     };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { ...run, status: signal?.aborted ? "aborted" : "error", endedAt: Date.now(), error: message };
+
+    try {
+      const result = await complete(resolved.model, context, {
+        signal,
+        apiKey: resolved.apiKey,
+        headers: resolved.headers,
+        maxTokens: 4096,
+      });
+
+      const answer = result.content
+        .filter((c): c is { type: "text"; text: string } => c.type === "text")
+        .map((c) => c.text)
+        .join("\n")
+        .trim() || "(subagent returned no text)";
+
+      return {
+        ...run,
+        status: result.stopReason === "aborted" ? "aborted" : "done",
+        endedAt: Date.now(),
+        answer,
+        tokensIn: result.usage.input,
+        tokensOut: result.usage.output,
+        costUsd: result.usage.cost.total,
+        error: result.stopReason === "aborted" ? "subagent aborted" : undefined,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ...run, status: signal?.aborted ? "aborted" : "error", endedAt: Date.now(), error: message };
+    }
   }
-}
-
-async function runExplore(params: { question: string; cwd?: string; model: SubagentModelPreset }, signal: AbortSignal | undefined, ctx: ExtensionContext, onUpdate?: (partial: RunResult) => void): Promise<RunResult> {
-  const startedAt = Date.now();
-  const subagentCwd = expandHome(params.cwd ?? ctx.cwd);
-  const run: RunResult = {
-    kind: "explore",
-    execution: "sync",
-    question: params.question,
-    cwd: subagentCwd,
-    modelPreset: params.model,
-    status: "running",
-    startedAt,
-    tokensIn: 0,
-    tokensOut: 0,
-    costUsd: 0,
-    toolCalls: [],
-  };
-  onUpdate?.(run);
-
-  const resolved = await resolveConfiguredModel(ctx, params.model);
-  if (!resolved.ok) return { ...run, status: "error", endedAt: Date.now(), error: resolved.error };
-  run.provider = resolved.provider;
-  run.model = resolved.modelId;
-  onUpdate?.(run);
 
   try {
     const settingsManager = SettingsManager.inMemory({
@@ -379,7 +341,7 @@ async function runExplore(params: { question: string; cwd?: string; model: Subag
     });
 
     const loader = new DefaultResourceLoader({
-      cwd: subagentCwd,
+      cwd,
       agentDir: getAgentDir(),
       settingsManager,
       noExtensions: true,
@@ -387,12 +349,12 @@ async function runExplore(params: { question: string; cwd?: string; model: Subag
       noPromptTemplates: true,
       noThemes: true,
       noContextFiles: true,
-      systemPrompt: EXPLORE_SYSTEM_PROMPT,
+      systemPrompt: buildSystemPrompt(input.role, input.tools),
     });
     await loader.reload();
 
     const { session } = await createAgentSessionShim({
-      cwd: subagentCwd,
+      cwd,
       agentDir: getAgentDir(),
       model: resolved.model,
       thinkingLevel: "off",
@@ -433,13 +395,13 @@ async function runExplore(params: { question: string; cwd?: string; model: Subag
     });
 
     try {
-      await session.prompt(params.question);
+      await session.prompt(input.task);
     } finally {
       unsubscribe();
       signal?.removeEventListener("abort", abortHandler);
     }
 
-    if (signal?.aborted) return { ...run, status: "aborted", endedAt: Date.now(), answer, error: "explore aborted" };
+    if (signal?.aborted) return { ...run, status: "aborted", endedAt: Date.now(), answer, error: "subagent aborted" };
     if (error) return { ...run, status: "error", endedAt: Date.now(), answer, error };
     return { ...run, status: "done", endedAt: Date.now(), answer: answer || "(subagent returned no text)" };
   } catch (err) {
@@ -455,7 +417,7 @@ async function createAgentSessionShim(args: Parameters<typeof import("@earendil-
 }
 
 function runToToolResult(run: RunResult) {
-  const text = run.status === "done" ? (run.answer ?? "(subagent returned no text)") : `${run.kind} ${run.status}: ${run.error ?? run.answer ?? "no details"}`;
+  const text = run.status === "done" ? (run.answer ?? "(subagent returned no text)") : `subagent ${run.status}: ${run.error ?? run.answer ?? "no details"}`;
   return {
     content: [{ type: "text" as const, text }],
     details: run,
@@ -465,18 +427,20 @@ function runToToolResult(run: RunResult) {
 
 function renderRun(run: RunResult, expanded: boolean, theme: Theme) {
   const icon = getStatusIcon(run.status, theme);
-  const title = `${icon} ${theme.fg("toolTitle", theme.bold(run.execution === "async" ? `${run.kind}_async` : run.kind))} ${theme.fg("accent", run.modelPreset)}`;
+  const title = `${icon} ${theme.fg("toolTitle", theme.bold(run.execution === "async" ? "subagent_async" : "subagent"))} ${theme.fg("accent", run.model)}`;
   const meta: string[] = [];
   if (run.id) meta.push(`#${run.id}`);
-  if (run.model) meta.push(run.model);
-  if (run.kind === "explore" && run.cwd) meta.push(run.cwd);
+  meta.push(run.tools);
+  if (run.modelId) meta.push(run.modelId);
+  if (run.cwd) meta.push(run.cwd);
   meta.push(formatElapsed(elapsedMs(run)));
 
   if (!expanded) {
     let text = `${title} ${theme.fg("muted", meta.join(" · "))}`;
-    text += `\n  ${theme.fg("dim", summarizeQuestion(run.question))}`;
+    text += `\n  ${theme.fg("muted", "role: ")}${theme.fg("dim", summarize(run.role, 100))}`;
+    text += `\n  ${theme.fg("muted", "task: ")}${theme.fg("dim", summarize(run.task, 100))}`;
     if (run.status === "running") {
-      const activity = run.kind === "explore" ? `${run.toolCalls.length} tool calls` : "reasoning";
+      const activity = run.tools === "read_only" ? `${run.toolCalls.length} tool calls` : "reasoning";
       text += `\n  ${theme.fg("warning", `running · ${activity}`)}`;
     } else if (run.status === "done") {
       const answer = (run.answer ?? "").split("\n").slice(0, 3).join("\n");
@@ -495,13 +459,11 @@ function renderRun(run: RunResult, expanded: boolean, theme: Theme) {
   const container = new Container();
   container.addChild(new Text(`${title} ${theme.fg("muted", meta.join(" · "))}`, 0, 0));
   container.addChild(new Spacer(1));
-  container.addChild(new Text(theme.fg("muted", "─── Question ───"), 0, 0));
-  container.addChild(new Text(theme.fg("dim", run.question), 0, 0));
-  if (run.context) {
-    container.addChild(new Spacer(1));
-    container.addChild(new Text(theme.fg("muted", "─── Provided Context ───"), 0, 0));
-    container.addChild(new Text(theme.fg("dim", run.context), 0, 0));
-  }
+  container.addChild(new Text(theme.fg("muted", "─── Role ───"), 0, 0));
+  container.addChild(new Text(theme.fg("dim", run.role), 0, 0));
+  container.addChild(new Spacer(1));
+  container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
+  container.addChild(new Text(theme.fg("dim", run.task), 0, 0));
   if (run.toolCalls.length > 0) {
     container.addChild(new Spacer(1));
     container.addChild(new Text(theme.fg("muted", `─── Tool calls (${run.toolCalls.length}) ───`), 0, 0));
@@ -525,15 +487,14 @@ function formatRunUsage(run: RunResult): string {
   const parts: string[] = [];
   if (run.tokensIn || run.tokensOut) parts.push(`↑${formatTokens(run.tokensIn)} ↓${formatTokens(run.tokensOut)}`);
   if (run.costUsd) parts.push(formatCost(run.costUsd));
-  if (run.kind === "explore") parts.push(`${run.toolCalls.length} tools`);
+  if (run.tools === "read_only") parts.push(`${run.toolCalls.length} tools`);
   return parts.join(" · ");
 }
 
-function makeJobId(kind: SubagentKind, tag?: string): string {
+function makeJobId(tag?: string): string {
   const cleaned = tag?.trim().replace(/^#/, "").replace(/[^a-zA-Z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "");
   if (cleaned) return cleaned;
-  const prefix = kind === "explore" ? "x" : "c";
-  return `${prefix}-${Date.now().toString(36).slice(-5)}-${Math.random().toString(36).slice(2, 5)}`;
+  return `s-${Date.now().toString(36).slice(-5)}-${Math.random().toString(36).slice(2, 5)}`;
 }
 
 function jobToMessage(job: AsyncJob): string {
@@ -542,15 +503,18 @@ function jobToMessage(job: AsyncJob): string {
   return [
     `Subagent result #${job.id} ${status}.`,
     "",
-    `Kind: ${job.kind}`,
-    `Model preset: ${job.modelPreset}`,
-    job.model ? `Model: ${job.provider}/${job.model}` : undefined,
+    `Model preset: ${job.model}`,
+    `Tool policy: ${job.tools}`,
+    job.modelId ? `Model: ${job.provider}/${job.modelId}` : undefined,
     job.cwd ? `CWD: ${job.cwd}` : undefined,
     `Elapsed: ${formatElapsed(elapsedMs(job))}`,
     `Usage: ${formatRunUsage(job) || "n/a"}`,
     "",
-    "Question:",
-    job.question,
+    "Role:",
+    job.role,
+    "",
+    "Task:",
+    job.task,
     "",
     "Result:",
     body,
@@ -569,10 +533,26 @@ function updateWidget(ctx: ExtensionContext | undefined, jobs: Map<string, Async
   const lines = ["Subagents"];
   for (const job of shown) {
     const icon = job.status === "running" ? "⏳" : job.status === "done" ? "✓" : "✗";
-    const activity = job.kind === "explore" ? `${job.toolCalls.length} tools` : "reasoning";
-    lines.push(`${icon} #${job.id} ${job.kind} ${job.modelPreset} ${formatElapsed(elapsedMs(job))} ${activity}`);
+    const activity = job.tools === "read_only" ? `${job.toolCalls.length} tools` : "reasoning";
+    lines.push(`${icon} #${job.id} ${job.model} ${job.tools} ${formatElapsed(elapsedMs(job))} ${activity}`);
   }
   ctx.ui.setWidget(WIDGET_KEY, lines);
+}
+
+function configErrorResult(input: SubagentInput, error: string) {
+  const result: RunResult = {
+    ...input,
+    execution: "sync",
+    status: "error",
+    startedAt: Date.now(),
+    endedAt: Date.now(),
+    error,
+    tokensIn: 0,
+    tokensOut: 0,
+    costUsd: 0,
+    toolCalls: [],
+  };
+  return { content: [{ type: "text" as const, text: error }], details: result, isError: true };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -615,78 +595,70 @@ export default function (pi: ExtensionAPI) {
   });
 
   const modelSchema = StringEnum(MODEL_PRESETS, { description: modelGuidance() });
+  const toolsSchema = StringEnum(TOOL_POLICIES, { description: toolsGuidance() });
   const deliverSchema = StringEnum(DELIVERY_OPTIONS, { description: "How to inject async results: steer interrupts at the next tool boundary; followUp waits until the agent is idle." });
+  const subagentTaskSchema = Type.Object({
+    tag: Type.Optional(Type.String({ description: "Optional stable async job tag, e.g. repo-a-review." })),
+    role: Type.String({ description: "Bespoke role/job framing for this subagent, e.g. 'You are a staff backend reviewer focused on API compatibility.'" }),
+    task: Type.String({ description: "Self-contained task. Include all context the subagent needs; it has no parent memory." }),
+    cwd: Type.Optional(Type.String({ description: "Working directory for read_only subagents. Relative paths resolve from the parent agent cwd." })),
+    model: modelSchema,
+    tools: toolsSchema,
+  });
 
   pi.registerTool({
-    name: "consult",
-    label: "Consult",
-    description: "Ask a self-contained reasoning question in a fresh context (no memory, no tools). Requires explicit model preset: fast, smart, or coder.",
-    promptSnippet: "consult(question, context?, model) — required model preset; one-shot no-tool reasoning subagent",
+    name: "subagent",
+    label: "Subagent",
+    description: "Run one fresh sub Pi agent with a bespoke role, task, cwd, required model preset, and required tool policy. Use this when the answer is needed before continuing.",
+    promptSnippet: "subagent(role, task, cwd?, model, tools) — run a fresh bespoke sub Pi agent synchronously",
     promptGuidelines: [
-      "Use consult for strategy, trade-off, design, debugging, or code-review questions where the answer comes from reasoning over supplied context rather than reading files.",
-      "Every consult call must choose model: fast for cheap quick reasoning, smart for balanced reasoning, coder for code-heavy analysis/review/debugging.",
-      "Consult has no memory and no tools. Include all needed snippets, errors, constraints, and prior decisions in the question/context.",
-      "If the answer needs reading files, use explore instead of consult.",
+      "Use subagent for scoped work that benefits from an isolated context and a bespoke role/job.",
+      "Every subagent call must choose model: fast, smart, or coder.",
+      "Every subagent call must choose tools: none for reasoning-only, read_only for codebase inspection with read/grep/find/ls.",
+      "Pack all necessary context into role/task. The subagent has no memory of this conversation.",
+      "Use subagents_async for independent work that can run while you continue. Use subagent when the next step depends on the result.",
     ],
     parameters: Type.Object({
-      question: Type.String({ description: "A self-contained reasoning question." }),
-      context: Type.Optional(Type.String({ description: "Optional context to prepend to the question." })),
+      role: subagentTaskSchema.properties.role,
+      task: subagentTaskSchema.properties.task,
+      cwd: subagentTaskSchema.properties.cwd,
       model: modelSchema,
+      tools: toolsSchema,
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const run = await runConsult(params, signal, ctx, (partial) => onUpdate?.({ content: [{ type: "text", text: `${partial.kind} running on ${partial.modelPreset}…` }], details: partial }));
+      const input: SubagentInput = {
+        role: params.role ?? "You are a helpful subagent.",
+        task: params.task ?? "",
+        cwd: params.cwd,
+        model: params.model as SubagentModelPreset,
+        tools: params.tools as SubagentToolPolicy,
+      };
+      const run = await runSubagent(input, "sync", signal, ctx, (partial) => onUpdate?.({
+        content: [{ type: "text", text: `subagent running on ${partial.model} with ${partial.tools}: ${partial.toolCalls.length} tool calls…` }],
+        details: partial,
+      }));
       return runToToolResult(run);
     },
     renderCall(args, theme) {
-      return new Text(`${theme.fg("toolTitle", theme.bold("consult "))}${theme.fg("accent", args.model ?? "model?")}\n  ${theme.fg("dim", summarizeQuestion(args.question ?? "…"))}`, 0, 0);
+      return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", args.model ?? "model?")} ${theme.fg("muted", args.tools ?? "tools?")}\n  ${theme.fg("muted", "role: ")}${theme.fg("dim", summarize(args.role ?? "…"))}\n  ${theme.fg("muted", "task: ")}${theme.fg("dim", summarize(args.task ?? "…"))}`, 0, 0);
     },
     renderResult(result, { expanded }, theme) { return renderRun(result.details as RunResult, expanded, theme); },
   });
 
-  pi.registerTool({
-    name: "explore",
-    label: "Explore",
-    description: "Ask a self-contained codebase question; a read-only subagent with read/grep/find/ls answers it. Requires explicit model preset: fast, smart, or coder.",
-    promptSnippet: "explore(question, cwd?, model) — required model preset; read-only codebase exploration subagent",
-    promptGuidelines: [
-      "Prefer explore over stacking many read/grep calls in the primary context, especially when surveying unfamiliar code or more than a few files.",
-      "Every explore call must choose model: fast for cheap reconnaissance, smart for default/balanced exploration, coder for code-heavy architecture/debugging investigation.",
-      "Phrase the question self-contained. The explore subagent has no memory of this conversation.",
-      "Explore is read-only: it cannot run bash or make changes. If command output or edits are needed, do that in the primary agent.",
-    ],
-    parameters: Type.Object({
-      question: Type.String({ description: "A self-contained codebase question. Include repo/path context if ambiguous." }),
-      cwd: Type.Optional(Type.String({ description: "Working directory for the subagent. Defaults to current cwd." })),
-      model: modelSchema,
-    }),
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const run = await runExplore(params, signal, ctx, (partial) => onUpdate?.({ content: [{ type: "text", text: `${partial.kind} running on ${partial.modelPreset}: ${partial.toolCalls.length} tool calls…` }], details: partial }));
-      return runToToolResult(run);
-    },
-    renderCall(args, theme) {
-      const cwdText = args.cwd ? ` ${theme.fg("muted", args.cwd)}` : "";
-      return new Text(`${theme.fg("toolTitle", theme.bold("explore "))}${theme.fg("accent", args.model ?? "model?")}${cwdText}\n  ${theme.fg("dim", summarizeQuestion(args.question ?? "…"))}`, 0, 0);
-    },
-    renderResult(result, { expanded }, theme) { return renderRun(result.details as RunResult, expanded, theme); },
-  });
-
-  function launchAsync(kind: SubagentKind, params: { question: string; context?: string; cwd?: string; model: SubagentModelPreset; tag?: string; deliver?: AsyncDelivery }, ctx: ExtensionContext): AsyncJob | { error: string } {
+  function launchAsync(input: SubagentInput & { tag?: string; deliver?: AsyncDelivery }, ctx: ExtensionContext): AsyncJob | { error: string } {
     const configResult = loadSubagentsConfig(ctx.cwd);
     if (!configResult.ok) return { error: configResult.error };
     const running = Array.from(jobs.values()).filter((j) => j.status === "running").length;
     if (running >= configResult.config.async.maxConcurrent) return { error: `subagents: async concurrency limit reached (${running}/${configResult.config.async.maxConcurrent}).` };
 
-    const id = makeJobId(kind, params.tag);
+    const id = makeJobId(input.tag);
     if (jobs.has(id)) return { error: `subagents: job #${id} already exists.` };
     const abortController = new AbortController();
     const job: AsyncJob = {
+      ...input,
       id,
-      kind,
       execution: "async",
-      question: params.question,
-      context: params.context,
-      cwd: params.cwd ? expandHome(params.cwd) : undefined,
-      modelPreset: params.model,
+      cwd: input.cwd ? expandHome(input.cwd) : ctx.cwd,
       status: "running",
       startedAt: Date.now(),
       tokensIn: 0,
@@ -694,7 +666,7 @@ export default function (pi: ExtensionAPI) {
       costUsd: 0,
       toolCalls: [],
       abortController,
-      deliver: params.deliver ?? configResult.config.async.defaultDelivery,
+      deliver: input.deliver ?? configResult.config.async.defaultDelivery,
     };
     jobs.set(id, job);
     widgetCtx = ctx;
@@ -705,18 +677,18 @@ export default function (pi: ExtensionAPI) {
         Object.assign(job, { ...partial, id, execution: "async", abortController, deliver: job.deliver });
         updateWidget(widgetCtx, jobs);
       };
-      const result = kind === "consult"
-        ? await runConsult({ question: params.question, context: params.context, model: params.model }, abortController.signal, ctx, update)
-        : await runExplore({ question: params.question, cwd: params.cwd, model: params.model }, abortController.signal, ctx, update);
+      const result = await runSubagent(input, "async", abortController.signal, ctx, update);
       Object.assign(job, { ...result, id, execution: "async", abortController, deliver: job.deliver });
       if (job.status === "aborted" && abortController.signal.aborted) job.status = "cancelled";
       job.endedAt = Date.now();
       updateWidget(widgetCtx, jobs);
       pi.appendEntry("pi-subagents:job", {
         id: job.id,
-        kind: job.kind,
-        modelPreset: job.modelPreset,
-        question: job.question,
+        model: job.model,
+        tools: job.tools,
+        role: job.role,
+        task: job.task,
+        cwd: job.cwd,
         status: job.status,
         answer: job.answer,
         error: job.error,
@@ -740,57 +712,58 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerTool({
-    name: "consult_async",
-    label: "Consult Async",
-    description: "Launch a reasoning subagent in the background and return immediately. The result arrives later as a tagged follow-up/steering user message. Requires explicit model preset.",
-    promptSnippet: "consult_async(question, context?, model, tag?, deliver?) — launch no-tool reasoning in background",
+    name: "subagents_async",
+    label: "Subagents Async",
+    description: "Launch one or more fresh sub Pi agents in the background. Each task supplies a bespoke role, task, cwd, required model preset, required tool policy, and optional tag. Results arrive later as tagged user messages.",
+    promptSnippet: "subagents_async(tasks, deliver?) — launch one or more bespoke sub Pi agents in the background",
     promptGuidelines: [
-      "Use consult_async only for independent reasoning that does not block your next step; results arrive later as a tagged user message.",
-      "Use sync consult when the next action depends on the answer.",
-      "Always provide a meaningful tag when launching multiple async subagents so you can correlate results.",
+      "Use subagents_async for independent work that does not block your next step, including parallel review/exploration across multiple repos.",
+      "Use one task per repo/scope. Give each task a clear tag so results can be correlated.",
+      "Every async subagent task must choose model and tools explicitly.",
+      "Use subagent instead when the next action depends on the result.",
     ],
     parameters: Type.Object({
-      question: Type.String({ description: "A self-contained reasoning question." }),
-      context: Type.Optional(Type.String({ description: "Optional context to prepend to the question." })),
-      model: modelSchema,
-      tag: Type.Optional(Type.String({ description: "Optional stable job tag, e.g. auth-review." })),
+      tasks: Type.Array(subagentTaskSchema, { minItems: 1, maxItems: 8, description: "Subagent tasks to launch." }),
       deliver: Type.Optional(deliverSchema),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const launchParams = { ...params, question: params.question ?? "", model: params.model as SubagentModelPreset };
-      const launched = launchAsync("consult", launchParams, ctx);
-      if (!("abortController" in launched)) return configErrorResult("consult", "async", launchParams.model, launchParams.question, launched.error);
-      return { content: [{ type: "text" as const, text: `Launched async consult #${launched.id}. Result will arrive via ${launched.deliver}.` }], details: launched };
-    },
-    renderCall(args, theme) { return new Text(`${theme.fg("toolTitle", theme.bold("consult_async "))}${theme.fg("accent", args.model ?? "model?")} ${theme.fg("muted", args.tag ? `#${args.tag}` : "") }\n  ${theme.fg("dim", summarizeQuestion(args.question ?? "…"))}`, 0, 0); },
-    renderResult(result, { expanded }, theme) { return renderRun(result.details as RunResult, expanded, theme); },
-  });
+      const configResult = loadSubagentsConfig(ctx.cwd);
+      if (!configResult.ok) {
+        const fallback: SubagentInput = { role: "configuration", task: "configuration", model: "smart", tools: "none" };
+        return configErrorResult(fallback, configResult.error);
+      }
+      const tasks = params.tasks ?? [];
+      const running = Array.from(jobs.values()).filter((j) => j.status === "running").length;
+      if (running + tasks.length > configResult.config.async.maxConcurrent) {
+        const error = `subagents: launching ${tasks.length} jobs would exceed async concurrency limit (${running}/${configResult.config.async.maxConcurrent} already running).`;
+        const fallback: SubagentInput = { role: "concurrency check", task: error, model: "smart", tools: "none" };
+        return configErrorResult(fallback, error);
+      }
 
-  pi.registerTool({
-    name: "explore_async",
-    label: "Explore Async",
-    description: "Launch a read-only codebase exploration subagent in the background and return immediately. The result arrives later as a tagged follow-up/steering user message. Requires explicit model preset.",
-    promptSnippet: "explore_async(question, cwd?, model, tag?, deliver?) — launch read-only codebase exploration in background",
-    promptGuidelines: [
-      "Use explore_async for independent codebase reconnaissance that can run while you continue other work.",
-      "Use sync explore when the next action depends on the answer.",
-      "Always provide a meaningful tag when launching multiple async subagents so you can correlate results.",
-    ],
-    parameters: Type.Object({
-      question: Type.String({ description: "A self-contained codebase question." }),
-      cwd: Type.Optional(Type.String({ description: "Working directory for the subagent. Defaults to current cwd." })),
-      model: modelSchema,
-      tag: Type.Optional(Type.String({ description: "Optional stable job tag, e.g. auth-map." })),
-      deliver: Type.Optional(deliverSchema),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const launchParams = { ...params, question: params.question ?? "", model: params.model as SubagentModelPreset };
-      const launched = launchAsync("explore", launchParams, ctx);
-      if (!("abortController" in launched)) return configErrorResult("explore", "async", launchParams.model, launchParams.question, launched.error);
-      return { content: [{ type: "text" as const, text: `Launched async explore #${launched.id}. Result will arrive via ${launched.deliver}.` }], details: launched };
+      const launched: AsyncJob[] = [];
+      const errors: string[] = [];
+      for (const task of tasks) {
+        const input = {
+          role: task.role ?? "You are a helpful subagent.",
+          task: task.task ?? "",
+          cwd: task.cwd,
+          model: task.model as SubagentModelPreset,
+          tools: task.tools as SubagentToolPolicy,
+          tag: task.tag,
+          deliver: params.deliver,
+        };
+        const result = launchAsync(input, ctx);
+        if ("abortController" in result) launched.push(result);
+        else errors.push(result.error);
+      }
+
+      const lines = [
+        launched.length > 0 ? `Launched ${launched.length} async subagent${launched.length === 1 ? "" : "s"}:` : "No subagents launched.",
+        ...launched.map((j) => `- #${j.id} ${j.model} ${j.tools} (${j.deliver})`),
+        ...errors.map((e) => `- error: ${e}`),
+      ];
+      return { content: [{ type: "text" as const, text: lines.join("\n") }], details: { launched, errors }, isError: errors.length > 0 };
     },
-    renderCall(args, theme) { return new Text(`${theme.fg("toolTitle", theme.bold("explore_async "))}${theme.fg("accent", args.model ?? "model?")} ${theme.fg("muted", args.tag ? `#${args.tag}` : "") }\n  ${theme.fg("dim", summarizeQuestion(args.question ?? "…"))}`, 0, 0); },
-    renderResult(result, { expanded }, theme) { return renderRun(result.details as RunResult, expanded, theme); },
   });
 
   pi.registerTool({
@@ -803,7 +776,7 @@ export default function (pi: ExtensionAPI) {
       const tag = params.tag?.replace(/^#/, "");
       const selected = tag ? [jobs.get(tag)].filter((j): j is AsyncJob => Boolean(j)) : Array.from(jobs.values());
       if (selected.length === 0) return { content: [{ type: "text" as const, text: tag ? `No async subagent job #${tag}.` : "No async subagent jobs." }], details: { jobs: [] } };
-      const lines = selected.map((j) => `#${j.id} ${j.status} ${j.kind} ${j.modelPreset} ${formatElapsed(elapsedMs(j))} ${formatRunUsage(j)}`.trim());
+      const lines = selected.map((j) => `#${j.id} ${j.status} ${j.model} ${j.tools} ${formatElapsed(elapsedMs(j))} ${formatRunUsage(j)}`.trim());
       return { content: [{ type: "text" as const, text: lines.join("\n") }], details: { jobs: selected.map(({ abortController: _a, ...j }) => j) } };
     },
   });
