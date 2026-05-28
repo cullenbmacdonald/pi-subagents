@@ -1,0 +1,37 @@
+{
+  "name": "pi-subagents",
+  "version": "0.1.0",
+  "description": "Configurable subagent extension package for Pi",
+  "keywords": [
+    "pi-package"
+  ],
+  "author": "Cullen MacDonald",
+  "license": "MIT",
+  "packageManager": "npm@11.15.0",
+  "files": [
+    "LICENSE",
+    "README.md",
+    "extensions",
+    "examples"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "0.75.5",
+    "@earendil-works/pi-coding-agent": "0.75.5",
+    "@earendil-works/pi-tui": "0.75.5"
+  },
+  "devDependencies": {
+    "@types/node": "25.9.1",
+    "typescript": "6.0.3",
+    "vitest": "4.1.7"
+  }
+}

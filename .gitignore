@@ -1,0 +1,4 @@
+node_modules/
+.pi/
+subagents.json
+.DS_Store
