@@ -521,22 +521,21 @@ function jobToMessage(job: AsyncJob): string {
   ].filter((line): line is string => line !== undefined).join("\n");
 }
 
+export function getSubagentWidgetLines(jobs: Iterable<AsyncJob>): string[] | undefined {
+  const active = Array.from(jobs).filter((j) => j.status === "running");
+  if (active.length === 0) return undefined;
+
+  const lines = ["Subagents"];
+  for (const job of active) {
+    const activity = job.tools === "read_only" ? `${job.toolCalls.length} tools` : "reasoning";
+    lines.push(`⏳ #${job.id} ${job.model} ${job.tools} ${formatElapsed(elapsedMs(job))} ${activity}`);
+  }
+  return lines;
+}
+
 function updateWidget(ctx: ExtensionContext | undefined, jobs: Map<string, AsyncJob>) {
   if (!ctx?.hasUI) return;
-  const active = Array.from(jobs.values()).filter((j) => j.status === "running");
-  const recentDone = Array.from(jobs.values()).filter((j) => j.status !== "running").slice(-3);
-  const shown = [...active, ...recentDone];
-  if (shown.length === 0) {
-    ctx.ui.setWidget(WIDGET_KEY, undefined);
-    return;
-  }
-  const lines = ["Subagents"];
-  for (const job of shown) {
-    const icon = job.status === "running" ? "⏳" : job.status === "done" ? "✓" : "✗";
-    const activity = job.tools === "read_only" ? `${job.toolCalls.length} tools` : "reasoning";
-    lines.push(`${icon} #${job.id} ${job.model} ${job.tools} ${formatElapsed(elapsedMs(job))} ${activity}`);
-  }
-  ctx.ui.setWidget(WIDGET_KEY, lines);
+  ctx.ui.setWidget(WIDGET_KEY, getSubagentWidgetLines(jobs.values()));
 }
 
 function configErrorResult(input: SubagentInput, error: string) {

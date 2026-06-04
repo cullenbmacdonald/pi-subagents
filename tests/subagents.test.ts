@@ -13,6 +13,78 @@ function makeDirs() {
   return { root, agentDir, cwd };
 }
 
+describe("subagents widget", () => {
+  it("hides when all async subagents are finished", async () => {
+    const { getSubagentWidgetLines } = await import("../extensions/subagents");
+
+    const lines = getSubagentWidgetLines([
+      {
+        id: "repo-a-review",
+        role: "reviewer",
+        task: "review repo a",
+        model: "coder",
+        tools: "read_only",
+        execution: "async",
+        status: "done",
+        startedAt: Date.now() - 1000,
+        endedAt: Date.now(),
+        tokensIn: 1,
+        tokensOut: 1,
+        costUsd: 0,
+        toolCalls: [{ name: "read", args: { path: "README.md" } }],
+        abortController: new AbortController(),
+        deliver: "followUp",
+      },
+    ]);
+
+    expect(lines).toBeUndefined();
+  });
+
+  it("shows only running async subagents", async () => {
+    const { getSubagentWidgetLines } = await import("../extensions/subagents");
+
+    const lines = getSubagentWidgetLines([
+      {
+        id: "running-review",
+        role: "reviewer",
+        task: "review repo",
+        model: "coder",
+        tools: "read_only",
+        execution: "async",
+        status: "running",
+        startedAt: Date.now() - 1000,
+        tokensIn: 0,
+        tokensOut: 0,
+        costUsd: 0,
+        toolCalls: [{ name: "read", args: { path: "README.md" } }],
+        abortController: new AbortController(),
+        deliver: "followUp",
+      },
+      {
+        id: "finished-review",
+        role: "reviewer",
+        task: "review done",
+        model: "coder",
+        tools: "read_only",
+        execution: "async",
+        status: "done",
+        startedAt: Date.now() - 2000,
+        endedAt: Date.now() - 1000,
+        tokensIn: 1,
+        tokensOut: 1,
+        costUsd: 0,
+        toolCalls: [],
+        abortController: new AbortController(),
+        deliver: "followUp",
+      },
+    ]);
+
+    expect(lines).toBeDefined();
+    expect(lines?.join("\n")).toContain("#running-review");
+    expect(lines?.join("\n")).not.toContain("#finished-review");
+  });
+});
+
 describe("subagents config", () => {
   it("reports missing required model slots", async () => {
     const { cwd } = makeDirs();
