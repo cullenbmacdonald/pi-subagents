@@ -533,9 +533,25 @@ export function getSubagentWidgetLines(jobs: Iterable<AsyncJob>): string[] | und
   return lines;
 }
 
+export function pruneCompletedSubagentJobsIfIdle(jobs: Map<string, { status: string }>): number {
+  const hasRunning = Array.from(jobs.values()).some((job) => job.status === "running");
+  if (hasRunning) return 0;
+
+  let pruned = 0;
+  for (const [id, job] of jobs) {
+    if (job.status !== "running") {
+      jobs.delete(id);
+      pruned++;
+    }
+  }
+  return pruned;
+}
+
 function updateWidget(ctx: ExtensionContext | undefined, jobs: Map<string, AsyncJob>) {
+  const lines = getSubagentWidgetLines(jobs.values());
+  if (!lines) pruneCompletedSubagentJobsIfIdle(jobs);
   if (!ctx?.hasUI) return;
-  ctx.ui.setWidget(WIDGET_KEY, getSubagentWidgetLines(jobs.values()));
+  ctx.ui.setWidget(WIDGET_KEY, lines);
 }
 
 function configErrorResult(input: SubagentInput, error: string) {

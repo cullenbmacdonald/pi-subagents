@@ -14,6 +14,29 @@ function makeDirs() {
 }
 
 describe("subagents widget", () => {
+  it("prunes completed async subagents when no jobs are running", async () => {
+    const { pruneCompletedSubagentJobsIfIdle } = await import("../extensions/subagents");
+    const jobs = new Map<string, { status: string }>([
+      ["done", { status: "done" }],
+      ["error", { status: "error" }],
+      ["cancelled", { status: "cancelled" }],
+    ]);
+
+    expect(pruneCompletedSubagentJobsIfIdle(jobs)).toBe(3);
+    expect(jobs.size).toBe(0);
+  });
+
+  it("keeps completed async subagents while another job is running", async () => {
+    const { pruneCompletedSubagentJobsIfIdle } = await import("../extensions/subagents");
+    const jobs = new Map<string, { status: string }>([
+      ["running", { status: "running" }],
+      ["done", { status: "done" }],
+    ]);
+
+    expect(pruneCompletedSubagentJobsIfIdle(jobs)).toBe(0);
+    expect(Array.from(jobs.keys())).toEqual(["running", "done"]);
+  });
+
   it("hides when all async subagents are finished", async () => {
     const { getSubagentWidgetLines } = await import("../extensions/subagents");
 
