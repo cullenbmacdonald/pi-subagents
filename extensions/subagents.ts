@@ -19,7 +19,8 @@ import {
   getMarkdownTheme,
   keyHint,
 } from "@earendil-works/pi-coding-agent";
-import { StringEnum, Type, complete, type Context } from "@earendil-works/pi-ai";
+import { StringEnum, Type } from "@earendil-works/pi-ai";
+import { complete, type Context } from "@earendil-works/pi-ai/compat";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 
 type SubagentModelPreset = "fast" | "smart" | "coder";
@@ -263,7 +264,7 @@ function toolsGuidance(): string {
   return "Required tool policy: none for reasoning-only; read_only for a fresh Pi agent with read/grep/find/ls.";
 }
 
-async function resolveConfiguredModel(ctx: ExtensionContext, preset: SubagentModelPreset): Promise<{ ok: true; provider: string; modelId: string; model: any; apiKey?: string; headers?: Record<string, string> } | { ok: false; error: string }> {
+async function resolveConfiguredModel(ctx: ExtensionContext, preset: SubagentModelPreset): Promise<{ ok: true; provider: string; modelId: string; model: any; apiKey?: string; headers?: Record<string, string>; env?: Record<string, string> } | { ok: false; error: string }> {
   const configResult = loadSubagentsConfig(ctx.cwd);
   if (!configResult.ok) return { ok: false, error: configResult.error };
   const selected = configResult.config.models[preset];
@@ -273,7 +274,11 @@ async function resolveConfiguredModel(ctx: ExtensionContext, preset: SubagentMod
   }
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok) return { ok: false, error: `subagents: could not resolve API key for ${selected.provider}: ${auth.error}` };
-  return { ok: true, provider: selected.provider, modelId: selected.model, model, apiKey: auth.apiKey, headers: auth.headers };
+  return { ok: true, provider: selected.provider, modelId: selected.model, model, apiKey: auth.apiKey, headers: auth.headers, env: auth.env };
+}
+
+function getModelRuntime(ctx: ExtensionContext): any {
+  return (ctx.modelRegistry as any).runtime;
 }
 
 async function runSubagent(input: SubagentInput, execution: "sync" | "async", signal: AbortSignal | undefined, ctx: ExtensionContext, onUpdate?: (partial: RunResult) => void): Promise<RunResult> {
@@ -309,6 +314,7 @@ async function runSubagent(input: SubagentInput, execution: "sync" | "async", si
         signal,
         apiKey: resolved.apiKey,
         headers: resolved.headers,
+        env: resolved.env,
         maxTokens: 4096,
       });
 
@@ -353,13 +359,17 @@ async function runSubagent(input: SubagentInput, execution: "sync" | "async", si
     });
     await loader.reload();
 
+    const modelRuntime = getModelRuntime(ctx);
+    if (!modelRuntime) {
+      return { ...run, status: "error", endedAt: Date.now(), error: "subagents: current Pi runtime does not expose model auth runtime." };
+    }
+
     const { session } = await createAgentSessionShim({
       cwd,
       agentDir: getAgentDir(),
       model: resolved.model,
       thinkingLevel: "off",
-      authStorage: ctx.modelRegistry.authStorage,
-      modelRegistry: ctx.modelRegistry,
+      modelRuntime,
       tools: ["read", "grep", "find", "ls"],
       resourceLoader: loader,
       sessionManager: SessionManager.inMemory(),
