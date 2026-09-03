@@ -14,7 +14,7 @@ function makeDirs() {
 }
 
 describe("subagents widget", () => {
-  it("prunes completed async subagents when no jobs are running", async () => {
+  it("retains completed async subagents when no jobs are running", async () => {
     const { pruneCompletedSubagentJobsIfIdle } = await import("../extensions/subagents");
     const jobs = new Map<string, { status: string }>([
       ["done", { status: "done" }],
@@ -22,8 +22,20 @@ describe("subagents widget", () => {
       ["cancelled", { status: "cancelled" }],
     ]);
 
-    expect(pruneCompletedSubagentJobsIfIdle(jobs)).toBe(3);
-    expect(jobs.size).toBe(0);
+    expect(pruneCompletedSubagentJobsIfIdle(jobs)).toBe(0);
+    expect(jobs.size).toBe(3);
+  });
+
+  it("bounds retained terminal async subagents by oldest completion", async () => {
+    const { pruneCompletedSubagentJobsIfIdle } = await import("../extensions/subagents");
+    const jobs = new Map<string, { status: string; endedAt?: number }>([
+      ["oldest", { status: "done", endedAt: 1 }],
+      ["middle", { status: "error", endedAt: 2 }],
+      ["newest", { status: "done", endedAt: 3 }],
+    ]);
+
+    expect(pruneCompletedSubagentJobsIfIdle(jobs, 2)).toBe(1);
+    expect(Array.from(jobs.keys())).toEqual(["middle", "newest"]);
   });
 
   it("keeps completed async subagents while another job is running", async () => {
@@ -43,20 +55,12 @@ describe("subagents widget", () => {
     const lines = getSubagentWidgetLines([
       {
         id: "repo-a-review",
-        role: "reviewer",
-        task: "review repo a",
         model: "coder",
         tools: "read_only",
-        execution: "async",
         status: "done",
         startedAt: Date.now() - 1000,
         endedAt: Date.now(),
-        tokensIn: 1,
-        tokensOut: 1,
-        costUsd: 0,
         toolCalls: [{ name: "read", args: { path: "README.md" } }],
-        abortController: new AbortController(),
-        deliver: "followUp",
       },
     ]);
 
@@ -69,42 +73,104 @@ describe("subagents widget", () => {
     const lines = getSubagentWidgetLines([
       {
         id: "running-review",
-        role: "reviewer",
-        task: "review repo",
         model: "coder",
         tools: "read_only",
-        execution: "async",
         status: "running",
         startedAt: Date.now() - 1000,
-        tokensIn: 0,
-        tokensOut: 0,
-        costUsd: 0,
         toolCalls: [{ name: "read", args: { path: "README.md" } }],
-        abortController: new AbortController(),
-        deliver: "followUp",
       },
       {
         id: "finished-review",
-        role: "reviewer",
-        task: "review done",
         model: "coder",
         tools: "read_only",
-        execution: "async",
         status: "done",
         startedAt: Date.now() - 2000,
         endedAt: Date.now() - 1000,
-        tokensIn: 1,
-        tokensOut: 1,
-        costUsd: 0,
         toolCalls: [],
-        abortController: new AbortController(),
-        deliver: "followUp",
       },
     ]);
 
     expect(lines).toBeDefined();
     expect(lines?.join("\n")).toContain("#running-review");
     expect(lines?.join("\n")).not.toContain("#finished-review");
+  });
+});
+
+describe("phase 2 orchestration tools", () => {
+  it("registers a synchronous parallel tool and an async wait barrier", async () => {
+    const { default: registerSubagents } = await import("../extensions/subagents");
+    const tools = new Map<string, any>();
+    registerSubagents({
+      on: () => {},
+      registerCommand: () => {},
+      registerTool: (tool: any) => tools.set(tool.name, tool),
+    } as any);
+
+    expect(tools.has("subagents_parallel")).toBe(true);
+    expect(tools.has("subagents_wait")).toBe(true);
+    expect(tools.get("subagents_parallel").description).toContain("wait for every result");
+
+    const result = await tools.get("subagents_wait").execute("wait", { all: true }, undefined, undefined, undefined);
+    expect(result.content[0].text).toContain("No active async subagent jobs");
+  });
+});
+
+describe("subagent waiting", () => {
+  it("waits until every selected running job completes", async () => {
+    let resolveFirst!: () => void;
+    let resolveSecond!: () => void;
+    const firstCompletion = new Promise<void>((resolve) => { resolveFirst = resolve; });
+    const secondCompletion = new Promise<void>((resolve) => { resolveSecond = resolve; });
+    const selected = [
+      { status: "running" as const, completion: firstCompletion },
+      { status: "running" as const, completion: secondCompletion },
+    ];
+
+    const waiting = (await import("../extensions/subagents")).waitForSubagentJobs(selected, 1000);
+    let settled = false;
+    void waiting.then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    resolveFirst();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    resolveSecond();
+    await expect(waiting).resolves.toBe("completed");
+  });
+
+  it("does not wait for jobs that are already terminal", async () => {
+    const { waitForSubagentJobs } = await import("../extensions/subagents");
+    await expect(waitForSubagentJobs([
+      { status: "done", completion: new Promise(() => {}) },
+    ], 1000)).resolves.toBe("completed");
+  });
+
+  it("returns aborted without cancelling the child", async () => {
+    const { waitForSubagentJobs } = await import("../extensions/subagents");
+    const controller = new AbortController();
+    const completion = new Promise<void>(() => {});
+    const waiting = waitForSubagentJobs([{ status: "running", completion }], 1000, controller.signal);
+
+    controller.abort();
+
+    await expect(waiting).resolves.toBe("aborted");
+    expect(controller.signal.aborted).toBe(true);
+  });
+
+  it("returns a timeout while leaving the completion promise untouched", async () => {
+    const { waitForSubagentJobs } = await import("../extensions/subagents");
+    let resolveChild!: () => void;
+    let childSettled = false;
+    const completion = new Promise<void>((resolve) => { resolveChild = resolve; }).then(() => { childSettled = true; });
+
+    await expect(waitForSubagentJobs([{ status: "running", completion }], 1)).resolves.toBe("timeout");
+    expect(childSettled).toBe(false);
+    resolveChild();
+    await completion;
+    expect(childSettled).toBe(true);
   });
 });
 

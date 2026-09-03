@@ -9,8 +9,10 @@ Configurable sync and async sub Pi agents for [Pi](https://pi.dev).
 It exposes:
 
 - `subagent` — run one bespoke sub Pi agent synchronously
+- `subagents_parallel` — run multiple sub Pi agents concurrently and wait for all results
 - `subagents_async` — launch one or more bespoke sub Pi agents in the background
-- `subagent_status` — inspect async jobs
+- `subagents_wait` — wait for selected async jobs and collect their results
+- `subagent_status` — inspect async jobs and retained results
 - `subagent_cancel` — cancel a running async job
 - `/subagents-config` — inspect resolved config
 
@@ -69,7 +71,34 @@ subagent(
 
 ---
 
-## `subagents_async(tasks, deliver?)`
+## `subagents_parallel(tasks)`
+
+Run multiple fresh sub Pi agents concurrently and wait for every result before returning. Use this when the parent needs the complete set of findings before continuing.
+
+```text
+subagents_parallel({
+  tasks: [
+    {
+      role: "You are a backend reviewer.",
+      task: "Review the API changes for correctness risks.",
+      model: "coder",
+      tools: "read_only"
+    },
+    {
+      role: "You are a test reviewer.",
+      task: "Review test coverage and missing regression cases.",
+      model: "smart",
+      tools: "read_only"
+    }
+  ]
+})
+```
+
+This is a synchronization barrier. It runs the children in parallel, but the parent cannot continue until all children finish or the parent aborts.
+
+---
+
+## `subagents_async(tasks, deliver?, handoff?)`
 
 Launch one or more fresh sub Pi agents in the background. Use for independent work that can run while the parent agent continues.
 
@@ -79,6 +108,7 @@ Arguments:
 |---|---:|---|
 | `tasks` | yes | Array of subagent tasks |
 | `deliver` | no | `followUp` or `steer`; defaults from config |
+| `handoff` | no | If true, end the parent turn after launch; results arrive later as one grouped completion |
 
 Each task has:
 
@@ -125,31 +155,63 @@ subagents_async(
 )
 ```
 
-Each result later arrives as a tagged user message:
+The launch response includes a `groupId` for collecting the whole batch. Completion results arrive later as one grouped user message after every job in the batch reaches a terminal state:
 
 ```md
-Subagent result #payroll-pr-review completed.
+Launched 3 async subagents in group g-abc123:
+- #payroll-pr-review coder read_only (followUp)
+- #benefits-pr-review coder read_only (followUp)
+- #employee-web-pr-review coder read_only (followUp)
+Use subagents_wait({ groupId: "g-abc123" }) before using these results.
+```
 
-Model preset: coder
-Tool policy: read_only
-CWD: /Users/you/dev/workspace/payroll-api
+The grouped completion normally has all child results together. If the parent successfully collects a subset with `subagents_wait`, those already-collected results may be omitted from the later notification and are called out in its header:
+
+```md
+Subagent group g-abc123 completed: 3/3 finished.
+All results are included below.
+
+### #payroll-pr-review completed
 ...
 
-Result:
+---
+
+### #benefits-pr-review completed
 ...
 ```
 
 ---
 
-## `subagent_status(tag?)`
+## `subagents_wait(groupId?, tags?, all?, timeoutMs?)`
 
-Check async job status.
+Wait for async subagent jobs to finish and return their results in the current tool result. This is a real synchronization barrier; it does not cancel children when the wait times out or is aborted.
+
+Use the `groupId` returned by `subagents_async` when the next phase depends on the complete batch:
+
+```text
+subagents_wait(groupId="g-abc123")
+```
+
+Other selectors:
+
+- `tags: ["api-review", "test-review"]` — wait for specific jobs
+- `all: true` — wait for every async job active when the wait begins in this parent session
+- `timeoutMs: 600000` — stop waiting after ten minutes; active children continue running
+
+If the wait is aborted or times out, the child jobs keep running and the grouped completion remains available. Use `subagents_wait` again or `subagent_status` rather than launching duplicate replacements.
+
+---
+
+## `subagent_status(tag?, groupId?)`
+
+Check async job status. Completed jobs are retained in bounded history for the current Pi session and can be collected later with `subagents_wait`.
 
 Examples:
 
 ```text
 subagent_status()
 subagent_status(tag="payroll-pr-review")
+subagent_status(groupId="g-abc123")
 ```
 
 ---
@@ -341,7 +403,7 @@ Use `pi --list-models`, `/model`, or your provider extension docs to confirm pro
 
 | Value | Behavior |
 |---|---|
-| `followUp` | Wait until the primary agent is idle before delivering the result. Safest default. |
+| `followUp` | Wait until the primary agent is idle before delivering the grouped result. Safest default. |
 | `steer` | Deliver after the current tool batch, before the next model turn. More interruptive. |
 
 Default comes from config:
@@ -361,9 +423,11 @@ Pi tool calls are synchronous from the model's perspective. Async subagents are 
 1. the launch tool starts background tasks
 2. the launch tool immediately returns job ids
 3. the parent agent continues
-4. each background task later injects a tagged user message with its result
+4. the group later injects one grouped user message after every child reaches a terminal state
 
-The parent agent **cannot await an async result in the same reasoning chain**. Use sync `subagent` if the next step depends on the answer.
+The parent agent **cannot await an async result in the same reasoning chain** unless it explicitly calls `subagents_wait`. Use sync `subagent` for one dependent task, or use `subagents_parallel` / `subagents_async` followed by `subagents_wait({ groupId })` for a dependent batch.
+
+Do not use `subagents_async` for work whose result you immediately need, and do not repeat an async subagent's investigation while it is running. Continue only with unrelated work or wait at the dependency boundary. Set `handoff: true` when the parent should end its current turn after launching instead of doing unrelated follow-up work; handoff ends the turn but does not itself wait.
 
 ---
 
@@ -373,16 +437,16 @@ The parent agent **cannot await an async result in the same reasoning chain**. U
 
 - tool kind and model preset
 - tool policy
-- job id/tag for async calls
+- job id/tag and group id for async calls
 - role and task preview
 - cwd
-- running/done/error status
+- running/done/error status and retained completion state
 - elapsed time
 - token/cost summary
 - read-only tool-call count
 - expandable markdown answer
 
-Async jobs also appear in a persistent widget while running and for recent completions:
+Async jobs appear in a persistent widget while running. Terminal results remain available through `subagent_status` and `subagents_wait` for the current Pi session:
 
 ```text
 Subagents
@@ -399,13 +463,17 @@ Good parent-agent instructions:
 ```md
 Use `subagent`/`subagents_async` aggressively for scoped work.
 
-- Use `subagent` when the next step depends on the result.
-- Use `subagents_async` for independent parallel investigations or reviews.
+- Use `subagent` when the next step depends on one result.
+- Use `subagents_parallel` when several parallel results are required before continuing.
+- Use `subagents_async` only for work that is genuinely independent of the current task; parallelizable does not mean independent.
+- If the next action depends on an async batch, call `subagents_wait` with its returned groupId before starting that action.
+- Do not repeat an async subagent's investigation while it is running. Continue only with unrelated work or wait at the dependency boundary.
 - Always provide a bespoke `role` and self-contained `task`.
 - Always choose `model`: `fast`, `smart`, or `coder`.
 - Always choose `tools`: `none` or `read_only`.
 - Use `fast` for cheap reconnaissance, `smart` for balanced exploration/reasoning, and `coder` for code-heavy review/debugging.
 - Use clear async tags when launching multiple subagents.
+- Set `handoff: true` on `subagents_async` when the parent should end its current turn instead of doing unrelated follow-up work.
 ```
 
 ---

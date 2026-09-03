@@ -10,7 +10,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
   DefaultResourceLoader,
   SessionManager,
@@ -103,9 +103,55 @@ interface RunResult extends SubagentInput {
 
 interface AsyncJob extends RunResult {
   id: string;
+  groupId: string;
+  sessionGeneration: number;
   abortController: AbortController;
+  completion: Promise<RunResult>;
+  resolveCompletion: (result: RunResult) => void;
+  completionSettled: boolean;
   deliver: AsyncDelivery;
+  abortReason?: "shutdown" | "cancelled";
 }
+
+interface AsyncGroup {
+  id: string;
+  jobIds: string[];
+  createdAt: number;
+  deliver: AsyncDelivery;
+  notified: boolean;
+  waiters: number;
+  collectedJobIds: Set<string>;
+}
+
+interface AsyncLaunchInput extends SubagentInput {
+  tag?: string;
+  deliver?: AsyncDelivery;
+  groupId: string;
+}
+
+export interface WaitableSubagentJob {
+  status: JobStatus;
+  completion: Promise<unknown>;
+}
+
+export type SubagentWaitOutcome = "completed" | "timeout" | "aborted";
+type ExtensionToolResult<T> = AgentToolResult<T> & { isError?: boolean };
+type SerializedAsyncJob = RunResult & { groupId: string };
+
+interface SubagentWaitDetails {
+  groupId?: string;
+  outcome?: SubagentWaitOutcome;
+  jobs: SerializedAsyncJob[];
+}
+
+interface SubagentStatusDetails {
+  groupId?: string;
+  jobs: SerializedAsyncJob[];
+}
+
+const MAX_RETAINED_TERMINAL_JOBS = 100;
+const MAX_RETAINED_GROUPS = 50;
+const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 
 function buildSystemPrompt(role: string, tools: SubagentToolPolicy): string {
   const toolPolicy = tools === "none"
@@ -230,7 +276,7 @@ function formatTokens(count: number): string {
   return `${(count / 1000000).toFixed(1)}M`;
 }
 
-function elapsedMs(run: RunResult): number {
+function elapsedMs(run: Pick<RunResult, "startedAt" | "endedAt">): number {
   return (run.endedAt ?? Date.now()) - run.startedAt;
 }
 
@@ -297,8 +343,11 @@ async function runSubagent(input: SubagentInput, execution: "sync" | "async", si
   };
   onUpdate?.(run);
 
+  if (signal?.aborted) return { ...run, status: "aborted", endedAt: Date.now(), error: "subagent aborted" };
+
   const resolved = await resolveConfiguredModel(ctx, input.model);
   if (!resolved.ok) return { ...run, status: "error", endedAt: Date.now(), error: resolved.error };
+  if (signal?.aborted) return { ...run, status: "aborted", endedAt: Date.now(), error: "subagent aborted" };
   run.provider = resolved.provider;
   run.modelId = resolved.modelId;
   onUpdate?.(run);
@@ -358,11 +407,13 @@ async function runSubagent(input: SubagentInput, execution: "sync" | "async", si
       systemPrompt: buildSystemPrompt(input.role, input.tools),
     });
     await loader.reload();
+    if (signal?.aborted) return { ...run, status: "aborted", endedAt: Date.now(), error: "subagent aborted" };
 
     const modelRuntime = getModelRuntime(ctx);
     if (!modelRuntime) {
       return { ...run, status: "error", endedAt: Date.now(), error: "subagents: current Pi runtime does not expose model auth runtime." };
     }
+    if (signal?.aborted) return { ...run, status: "aborted", endedAt: Date.now(), error: "subagent aborted" };
 
     const { session } = await createAgentSessionShim({
       cwd,
@@ -375,6 +426,12 @@ async function runSubagent(input: SubagentInput, execution: "sync" | "async", si
       sessionManager: SessionManager.inMemory(),
       settingsManager,
     });
+
+    if (signal?.aborted) {
+      await session.abort();
+      session.dispose();
+      return { ...run, status: "aborted", endedAt: Date.now(), error: "subagent aborted" };
+    }
 
     const abortHandler = () => { void session.abort(); };
     signal?.addEventListener("abort", abortHandler);
@@ -493,7 +550,9 @@ function renderRun(run: RunResult, expanded: boolean, theme: Theme) {
   return container;
 }
 
-function formatRunUsage(run: RunResult): string {
+type UsageRun = Pick<RunResult, "tokensIn" | "tokensOut" | "costUsd" | "tools" | "toolCalls">;
+
+function formatRunUsage(run: UsageRun): string {
   const parts: string[] = [];
   if (run.tokensIn || run.tokensOut) parts.push(`↑${formatTokens(run.tokensIn)} ↓${formatTokens(run.tokensOut)}`);
   if (run.costUsd) parts.push(formatCost(run.costUsd));
@@ -501,37 +560,159 @@ function formatRunUsage(run: RunResult): string {
   return parts.join(" · ");
 }
 
-function makeJobId(tag?: string): string {
+function normalizeJobTag(tag?: string): string | undefined {
   const cleaned = tag?.trim().replace(/^#/, "").replace(/[^a-zA-Z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "");
-  if (cleaned) return cleaned;
-  return `s-${Date.now().toString(36).slice(-5)}-${Math.random().toString(36).slice(2, 5)}`;
+  return cleaned || undefined;
 }
 
-function jobToMessage(job: AsyncJob): string {
-  const status = job.status === "done" ? "completed" : job.status;
-  const body = job.status === "done" ? job.answer : job.error ?? job.answer ?? "No result text.";
+function makeJobId(tag?: string): string {
+  return normalizeJobTag(tag) ?? `s-${Date.now().toString(36).slice(-5)}-${Math.random().toString(36).slice(2, 5)}`;
+}
+
+function makeGroupId(): string {
+  return `g-${Date.now().toString(36).slice(-5)}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+function jobToRunResult(job: AsyncJob): RunResult {
+  const { abortController: _abortController, completion: _completion, resolveCompletion: _resolveCompletion, completionSettled: _completionSettled, groupId: _groupId, sessionGeneration: _sessionGeneration, deliver: _deliver, abortReason: _abortReason, ...result } = job;
+  return result;
+}
+
+function settleJobCompletion(job: AsyncJob): void {
+  if (job.completionSettled) return;
+  job.completionSettled = true;
+  job.resolveCompletion(jobToRunResult(job));
+}
+
+function jobDetails(job: AsyncJob): SerializedAsyncJob {
+  const { abortController: _abortController, completion: _completion, resolveCompletion: _resolveCompletion, completionSettled: _completionSettled, sessionGeneration: _sessionGeneration, deliver: _deliver, abortReason: _abortReason, ...details } = job;
+  return details;
+}
+
+/** Wait for the selected running jobs without cancelling them when the wait ends. */
+export function waitForSubagentJobs(
+  selected: readonly WaitableSubagentJob[],
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<SubagentWaitOutcome> {
+  const running = selected.filter((job) => job.status === "running");
+  if (running.length === 0) return Promise.resolve("completed");
+  if (signal?.aborted) return Promise.resolve("aborted");
+
+  return new Promise<SubagentWaitOutcome>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => finish("timeout"), timeoutMs);
+    const onAbort = () => finish("aborted");
+
+    const finish = (outcome: SubagentWaitOutcome) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(outcome);
+    };
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+    Promise.all(running.map((job) => job.completion.catch(() => undefined))).then(() => finish("completed"));
+  });
+}
+
+function makeParentAbortedRun(input: SubagentInput, ctx: ExtensionContext): RunResult {
+  return {
+    ...input,
+    execution: "sync",
+    cwd: input.cwd ? expandHome(input.cwd) : ctx.cwd,
+    status: "aborted",
+    startedAt: Date.now(),
+    endedAt: Date.now(),
+    error: "parent aborted before subagent completed",
+    tokensIn: 0,
+    tokensOut: 0,
+    costUsd: 0,
+    toolCalls: [],
+  };
+}
+
+async function runParallelSubagents(
+  inputs: readonly SubagentInput[],
+  signal: AbortSignal | undefined,
+  ctx: ExtensionContext,
+): Promise<RunResult[]> {
+  if (signal?.aborted) return inputs.map((input) => makeParentAbortedRun(input, ctx));
+
+  const results: Array<RunResult | undefined> = new Array(inputs.length);
+  const childPromises = inputs.map((input, index) => runSubagent(input, "sync", signal, ctx).then((result) => {
+    results[index] = result;
+    return result;
+  }));
+  const allChildren = Promise.all(childPromises);
+  if (!signal) return allChildren;
+
+  let abort!: () => void;
+  const aborted = new Promise<"aborted">((resolve) => { abort = () => resolve("aborted"); });
+  const onAbort = () => abort();
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) abort();
+  try {
+    const outcome = await Promise.race([
+      allChildren.then((completed) => ({ type: "completed" as const, results: completed })),
+      aborted.then(() => ({ type: "aborted" as const })),
+    ]);
+    if (outcome.type === "completed") return outcome.results;
+
+    // Synchronous children must not become detached when the parent aborts.
+    // runSubagent receives the same signal and is responsible for unwinding;
+    // wait for that cleanup before returning the tool result.
+    const settled = await allChildren;
+    return inputs.map((input, index) => settled[index] ?? makeParentAbortedRun(input, ctx));
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+function formatRunResult(run: RunResult, label: string): string {
+  const status = run.status === "done" ? "completed" : run.status;
+  const body = run.status === "done" ? run.answer : run.error ?? run.answer ?? "No result text.";
   return [
-    `Subagent result #${job.id} ${status}.`,
-    "",
-    `Model preset: ${job.model}`,
-    `Tool policy: ${job.tools}`,
-    job.modelId ? `Model: ${job.provider}/${job.modelId}` : undefined,
-    job.cwd ? `CWD: ${job.cwd}` : undefined,
-    `Elapsed: ${formatElapsed(elapsedMs(job))}`,
-    `Usage: ${formatRunUsage(job) || "n/a"}`,
+    `### ${label} ${status}`,
+    `Model preset: ${run.model}`,
+    `Tool policy: ${run.tools}`,
+    run.modelId ? `Model: ${run.provider}/${run.modelId}` : undefined,
+    run.cwd ? `CWD: ${run.cwd}` : undefined,
+    `Elapsed: ${formatElapsed(elapsedMs(run))}`,
+    `Usage: ${formatRunUsage(run) || "n/a"}`,
     "",
     "Role:",
-    job.role,
+    run.role,
     "",
     "Task:",
-    job.task,
+    run.task,
     "",
     "Result:",
     body,
   ].filter((line): line is string => line !== undefined).join("\n");
 }
 
-export function getSubagentWidgetLines(jobs: Iterable<AsyncJob>): string[] | undefined {
+function formatAsyncJobResult(job: AsyncJob): string {
+  return formatRunResult(job, `#${job.id}`);
+}
+
+function formatAsyncGroupMessage(group: AsyncGroup, allJobs: AsyncJob[], jobsToReport: AsyncJob[]): string {
+  const completed = allJobs.filter((job) => job.status !== "running").length;
+  const failed = allJobs.filter((job) => job.status !== "running" && job.status !== "done").length;
+  const status = failed > 0 ? "completed with errors" : "completed";
+  const collected = allJobs.length - jobsToReport.length;
+  return [
+    `Subagent group ${group.id} ${status}: ${completed}/${allJobs.length} finished.`,
+    collected > 0 ? `Results for ${collected} job${collected === 1 ? "" : "s"} were already collected by the parent.` : "All results are included below.",
+    "",
+    jobsToReport.map(formatAsyncJobResult).join("\n\n---\n\n"),
+  ].join("\n");
+}
+
+type WidgetJob = Pick<RunResult, "id" | "model" | "tools" | "status" | "startedAt" | "endedAt" | "toolCalls">;
+
+export function getSubagentWidgetLines(jobs: Iterable<WidgetJob>): string[] | undefined {
   const active = Array.from(jobs).filter((j) => j.status === "running");
   if (active.length === 0) return undefined;
 
@@ -543,23 +724,76 @@ export function getSubagentWidgetLines(jobs: Iterable<AsyncJob>): string[] | und
   return lines;
 }
 
-export function pruneCompletedSubagentJobsIfIdle(jobs: Map<string, { status: string }>): number {
-  const hasRunning = Array.from(jobs.values()).some((job) => job.status === "running");
-  if (hasRunning) return 0;
+export function pruneCompletedSubagentJobsIfIdle(
+  jobs: Map<string, { status: string; endedAt?: number }>,
+  maxRetained = MAX_RETAINED_TERMINAL_JOBS,
+): number {
+  const terminal = Array.from(jobs.entries()).filter(([, job]) => job.status !== "running");
+  if (terminal.length <= maxRetained) return 0;
 
+  terminal.sort(([, a], [, b]) => (a.endedAt ?? 0) - (b.endedAt ?? 0));
   let pruned = 0;
-  for (const [id, job] of jobs) {
-    if (job.status !== "running") {
-      jobs.delete(id);
+  for (const [id] of terminal.slice(0, terminal.length - maxRetained)) {
+    jobs.delete(id);
+    pruned++;
+  }
+  return pruned;
+}
+
+function pruneAsyncGroups(groups: Map<string, AsyncGroup>, jobs: Map<string, AsyncJob>): number {
+  const groupEntries = Array.from(groups.values());
+  let pruned = 0;
+
+  // Never leave a group pointing at a partially evicted batch. Tags can still
+  // retrieve any retained jobs, but the group handle must either identify the
+  // complete batch or no longer exist.
+  for (const group of groupEntries) {
+    if (group.jobIds.some((id) => !jobs.has(id))) {
+      groups.delete(group.id);
+      pruned++;
+    }
+  }
+  if (groups.size <= MAX_RETAINED_GROUPS) return pruned;
+
+  groupEntries.sort((a, b) => a.createdAt - b.createdAt);
+  for (const group of groupEntries) {
+    if (groups.size <= MAX_RETAINED_GROUPS) break;
+    if (!groups.has(group.id)) continue;
+    const hasRunningJob = group.jobIds.some((id) => jobs.get(id)?.status === "running");
+    if (!hasRunningJob) {
+      groups.delete(group.id);
       pruned++;
     }
   }
   return pruned;
 }
 
-function updateWidget(ctx: ExtensionContext | undefined, jobs: Map<string, AsyncJob>) {
+function pruneRetainedAsyncState(jobs: Map<string, AsyncJob>, groups: Map<string, AsyncGroup>): void {
+  let terminalCount = Array.from(jobs.values()).filter((job) => job.status !== "running").length;
+  if (terminalCount > MAX_RETAINED_TERMINAL_JOBS) {
+    const groupEntries = Array.from(groups.values()).sort((a, b) => a.createdAt - b.createdAt);
+    for (const group of groupEntries) {
+      if (terminalCount <= MAX_RETAINED_TERMINAL_JOBS) break;
+      const groupJobs = group.jobIds.map((id) => jobs.get(id));
+      if (groupJobs.some((job) => !job || job.status === "running")) continue;
+      for (const id of group.jobIds) {
+        if (jobs.delete(id)) terminalCount--;
+      }
+      groups.delete(group.id);
+    }
+  }
+
+  // This handles any ungrouped/legacy entries and also removes groups whose
+  // complete batch was evicted. Grouped jobs are evicted as a unit above so a
+  // retained group never points at only part of its original batch.
+  pruneCompletedSubagentJobsIfIdle(jobs);
+  pruneAsyncGroups(groups, jobs);
+}
+
+function updateWidget(ctx: ExtensionContext | undefined, jobs: Map<string, AsyncJob>, groups?: Map<string, AsyncGroup>) {
   const lines = getSubagentWidgetLines(jobs.values());
-  if (!lines) pruneCompletedSubagentJobsIfIdle(jobs);
+  if (groups) pruneRetainedAsyncState(jobs, groups);
+  else pruneCompletedSubagentJobsIfIdle(jobs);
   if (!ctx?.hasUI) return;
   ctx.ui.setWidget(WIDGET_KEY, lines);
 }
@@ -582,22 +816,33 @@ function configErrorResult(input: SubagentInput, error: string) {
 
 export default function (pi: ExtensionAPI) {
   const jobs = new Map<string, AsyncJob>();
+  const groups = new Map<string, AsyncGroup>();
   let widgetCtx: ExtensionContext | undefined;
+  let sessionGeneration = 0;
+  let sessionActive = false;
 
   pi.on("session_start", (_event, ctx) => {
+    sessionGeneration++;
+    sessionActive = true;
+    jobs.clear();
+    groups.clear();
     widgetCtx = ctx;
-    updateWidget(widgetCtx, jobs);
+    updateWidget(widgetCtx, jobs, groups);
   });
 
   pi.on("session_shutdown", () => {
+    sessionActive = false;
     for (const job of jobs.values()) {
       if (job.status === "running") {
         job.status = "aborted";
+        job.abortReason = "shutdown";
         job.endedAt = Date.now();
         job.error = "session shut down before subagent completed";
+        settleJobCompletion(job);
         job.abortController.abort();
       }
     }
+    updateWidget(widgetCtx, jobs, groups);
   });
 
   pi.registerCommand("subagents-config", {
@@ -622,11 +867,24 @@ export default function (pi: ExtensionAPI) {
   const modelSchema = StringEnum(MODEL_PRESETS, { description: modelGuidance() });
   const toolsSchema = StringEnum(TOOL_POLICIES, { description: toolsGuidance() });
   const deliverSchema = StringEnum(DELIVERY_OPTIONS, { description: "How to inject async results: steer interrupts at the next tool boundary; followUp waits until the agent is idle." });
+  const subagentWaitSchema = Type.Object({
+    groupId: Type.Optional(Type.String({ description: "Async group id returned by subagents_async. Waits for every job in the group." })),
+    tags: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 8, description: "Job tags/ids to wait for. Waits for every matching job." })),
+    all: Type.Optional(Type.Boolean({ description: "Wait for all currently active async jobs in this parent session." })),
+    timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum time to wait. Children continue running if the wait times out." })),
+  });
   const subagentTaskSchema = Type.Object({
     tag: Type.Optional(Type.String({ description: "Optional stable async job tag, e.g. repo-a-review." })),
     role: Type.String({ description: "Bespoke role/job framing for this subagent, e.g. 'You are a staff backend reviewer focused on API compatibility.'" }),
     task: Type.String({ description: "Self-contained task. Include all context the subagent needs; it has no parent memory." }),
     cwd: Type.Optional(Type.String({ description: "Working directory for read_only subagents. Relative paths resolve from the parent agent cwd." })),
+    model: modelSchema,
+    tools: toolsSchema,
+  });
+  const parallelTaskSchema = Type.Object({
+    role: subagentTaskSchema.properties.role,
+    task: subagentTaskSchema.properties.task,
+    cwd: subagentTaskSchema.properties.cwd,
     model: modelSchema,
     tools: toolsSchema,
   });
@@ -641,7 +899,6 @@ export default function (pi: ExtensionAPI) {
       "Every subagent call must choose model: fast, smart, or coder.",
       "Every subagent call must choose tools: none for reasoning-only, read_only for codebase inspection with read/grep/find/ls.",
       "Pack all necessary context into role/task. The subagent has no memory of this conversation.",
-      "Use subagents_async for independent work that can run while you continue. Use subagent when the next step depends on the result.",
     ],
     parameters: Type.Object({
       role: subagentTaskSchema.properties.role,
@@ -670,20 +927,87 @@ export default function (pi: ExtensionAPI) {
     renderResult(result, { expanded }, theme) { return renderRun(result.details as RunResult, expanded, theme); },
   });
 
-  function launchAsync(input: SubagentInput & { tag?: string; deliver?: AsyncDelivery }, ctx: ExtensionContext): AsyncJob | { error: string } {
+  pi.registerTool({
+    name: "subagents_parallel",
+    label: "Parallel Subagents",
+    description: "Run multiple fresh sub Pi agents concurrently and wait for every result before returning. Use this when the parent needs the complete set of findings before continuing.",
+    promptSnippet: "subagents_parallel(tasks) — run parallel subagents and wait for all results",
+    promptGuidelines: [
+      "Use subagents_parallel when the next phase depends on all delegated results.",
+      "This tool is a synchronization barrier: it does not return until every child has finished or the parent aborts.",
+      "Use subagents_async instead only when the work is genuinely independent and the parent will not duplicate or immediately depend on it.",
+    ],
+    parameters: Type.Object({
+      tasks: Type.Array(parallelTaskSchema, { minItems: 1, maxItems: 8, description: "Independent subagent tasks to run concurrently." }),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const tasks = params.tasks ?? [];
+      const inputs = tasks.map((task) => ({
+        role: task.role ?? "You are a helpful subagent.",
+        task: task.task ?? "",
+        cwd: task.cwd,
+        model: task.model as SubagentModelPreset,
+        tools: task.tools as SubagentToolPolicy,
+      }));
+      const results = await runParallelSubagents(inputs, signal, ctx);
+      const failures = results.filter((run) => run.status !== "done").length;
+      const text = [
+        `Parallel subagents completed: ${results.length - failures}/${results.length} succeeded.`,
+        "",
+        results.map((run, index) => formatRunResult(run, `subagent-${index + 1}`)).join("\n\n---\n\n"),
+      ].join("\n");
+      return { content: [{ type: "text" as const, text }], details: { runs: results }, isError: failures > 0 };
+    },
+  });
+
+  function maybeDeliverCompletedGroup(groupId: string): void {
+    const group = groups.get(groupId);
+    if (!group || group.notified) return;
+
+    const groupJobs = group.jobIds
+      .map((id) => jobs.get(id))
+      .filter((job): job is AsyncJob => Boolean(job));
+    if (groupJobs.length !== group.jobIds.length || groupJobs.some((job) => job.status === "running")) return;
+
+    // A waiter is the authoritative result channel. Omit jobs it already
+    // collected, while still notifying about uncollected siblings.
+    if (group.waiters > 0) return;
+    const jobsToReport = groupJobs.filter((job) => !group.collectedJobIds.has(job.id));
+    if (jobsToReport.length === 0) {
+      group.notified = true;
+      return;
+    }
+
+    try {
+      pi.sendUserMessage(formatAsyncGroupMessage(group, groupJobs, jobsToReport), { deliverAs: group.deliver });
+      group.notified = true;
+    } catch (err) {
+      console.error(`pi-subagents: could not deliver group ${group.id}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  function launchAsync(input: AsyncLaunchInput, ctx: ExtensionContext): AsyncJob | { error: string } {
     const configResult = loadSubagentsConfig(ctx.cwd);
     if (!configResult.ok) return { error: configResult.error };
     const running = Array.from(jobs.values()).filter((j) => j.status === "running").length;
     if (running >= configResult.config.async.maxConcurrent) return { error: `subagents: async concurrency limit reached (${running}/${configResult.config.async.maxConcurrent}).` };
 
-    const id = makeJobId(input.tag);
+    const { tag, deliver, groupId, ...baseInput } = input;
+    const id = makeJobId(tag);
     if (jobs.has(id)) return { error: `subagents: job #${id} already exists.` };
+
     const abortController = new AbortController();
+    let resolveCompletion: (result: RunResult) => void = () => {};
+    const completion = new Promise<RunResult>((resolve) => {
+      resolveCompletion = resolve;
+    });
     const job: AsyncJob = {
-      ...input,
+      ...baseInput,
       id,
+      groupId,
+      sessionGeneration,
       execution: "async",
-      cwd: input.cwd ? expandHome(input.cwd) : ctx.cwd,
+      cwd: baseInput.cwd ? expandHome(baseInput.cwd) : ctx.cwd,
       status: "running",
       startedAt: Date.now(),
       tokensIn: 0,
@@ -691,47 +1015,84 @@ export default function (pi: ExtensionAPI) {
       costUsd: 0,
       toolCalls: [],
       abortController,
-      deliver: input.deliver ?? configResult.config.async.defaultDelivery,
+      completion,
+      resolveCompletion,
+      completionSettled: false,
+      deliver: deliver ?? configResult.config.async.defaultDelivery,
     };
     jobs.set(id, job);
     widgetCtx = ctx;
-    updateWidget(widgetCtx, jobs);
+    updateWidget(widgetCtx, jobs, groups);
 
     void (async () => {
-      const update = (partial: RunResult) => {
-        Object.assign(job, { ...partial, id, execution: "async", abortController, deliver: job.deliver });
-        updateWidget(widgetCtx, jobs);
-      };
-      const result = await runSubagent(input, "async", abortController.signal, ctx, update);
-      Object.assign(job, { ...result, id, execution: "async", abortController, deliver: job.deliver });
-      if (job.status === "aborted" && abortController.signal.aborted) job.status = "cancelled";
+      let result: RunResult;
+      try {
+        const update = (partial: RunResult) => {
+          if (job.abortReason) return;
+          if (!sessionActive || job.sessionGeneration !== sessionGeneration) return;
+          Object.assign(job, { ...partial, id, groupId, sessionGeneration, execution: "async", abortController, completion, resolveCompletion, completionSettled: job.completionSettled, deliver: job.deliver });
+          updateWidget(widgetCtx, jobs, groups);
+        };
+        result = await runSubagent(baseInput, "async", abortController.signal, ctx, update);
+      } catch (err) {
+        result = {
+          ...baseInput,
+          id,
+          execution: "async",
+          cwd: job.cwd,
+          status: job.status === "cancelled" ? "cancelled" : "error",
+          startedAt: job.startedAt,
+          endedAt: Date.now(),
+          error: err instanceof Error ? err.message : String(err),
+          tokensIn: job.tokensIn,
+          tokensOut: job.tokensOut,
+          costUsd: job.costUsd,
+          toolCalls: job.toolCalls,
+        };
+      }
+
+      const abortReason = job.abortReason;
+      const belongsToCurrentSession = sessionActive && job.sessionGeneration === sessionGeneration;
+      Object.assign(job, { ...result, id, groupId, sessionGeneration: job.sessionGeneration, execution: "async", abortController, completion, resolveCompletion, completionSettled: job.completionSettled, deliver: job.deliver });
+      if (abortReason === "cancelled") {
+        job.status = "cancelled";
+        job.error = "cancelled by primary agent";
+      } else if (abortReason === "shutdown") {
+        job.status = "aborted";
+        job.error = "session shut down before subagent completed";
+      }
       job.endedAt = Date.now();
-      updateWidget(widgetCtx, jobs);
-      pi.appendEntry("pi-subagents:job", {
-        id: job.id,
-        model: job.model,
-        tools: job.tools,
-        role: job.role,
-        task: job.task,
-        cwd: job.cwd,
-        status: job.status,
-        answer: job.answer,
-        error: job.error,
-        startedAt: job.startedAt,
-        endedAt: job.endedAt,
-        tokensIn: job.tokensIn,
-        tokensOut: job.tokensOut,
-        costUsd: job.costUsd,
-        toolCalls: job.toolCalls.length,
-      });
-      pi.sendUserMessage(jobToMessage(job), { deliverAs: job.deliver });
-    })().catch((err) => {
-      job.status = "error";
-      job.endedAt = Date.now();
-      job.error = err instanceof Error ? err.message : String(err);
-      updateWidget(widgetCtx, jobs);
-      pi.sendUserMessage(jobToMessage(job), { deliverAs: job.deliver });
-    });
+      if (belongsToCurrentSession) updateWidget(widgetCtx, jobs, groups);
+      settleJobCompletion(job);
+
+      if (!belongsToCurrentSession || abortReason === "shutdown") return;
+
+      try {
+        pi.appendEntry("pi-subagents:job", {
+          id: job.id,
+          groupId: job.groupId,
+          model: job.model,
+          tools: job.tools,
+          role: job.role,
+          task: job.task,
+          cwd: job.cwd,
+          status: job.status,
+          answer: job.answer,
+          error: job.error,
+          startedAt: job.startedAt,
+          endedAt: job.endedAt,
+          tokensIn: job.tokensIn,
+          tokensOut: job.tokensOut,
+          costUsd: job.costUsd,
+          toolCalls: job.toolCalls.length,
+        });
+      } catch (err) {
+        // The child result is already available to waiters. A stale session or
+        // persistence failure must not turn a successful child run into an error.
+        console.error(`pi-subagents: could not persist job #${job.id}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      maybeDeliverCompletedGroup(job.groupId);
+    })();
 
     return job;
   }
@@ -739,17 +1100,20 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagents_async",
     label: "Subagents Async",
-    description: "Launch one or more fresh sub Pi agents in the background. Each task supplies a bespoke role, task, cwd, required model preset, required tool policy, and optional tag. Results arrive later as tagged user messages.",
-    promptSnippet: "subagents_async(tasks, deliver?) — launch one or more bespoke sub Pi agents in the background",
+    description: "Launch one or more fresh sub Pi agents in the background. Each task supplies a bespoke role, task, cwd, required model preset, required tool policy, and optional tag. Returns a groupId for waiting on the complete batch; results also arrive later as tagged user messages.",
+    promptSnippet: "subagents_async(tasks, deliver?, handoff?) — launch background subagents and return a groupId",
     promptGuidelines: [
-      "Use subagents_async for independent work that does not block your next step, including parallel review/exploration across multiple repos.",
-      "Use one task per repo/scope. Give each task a clear tag so results can be correlated.",
+      "Use subagents_async only for work that is genuinely independent of the current task; parallelizable does not mean independent.",
+      "Use one task per repo/scope and give each task a clear tag so results can be correlated.",
       "Every async subagent task must choose model and tools explicitly.",
-      "Use subagent instead when the next action depends on the result.",
+      "If your next action depends on these results, call subagents_wait with the returned groupId before starting that action.",
+      "Do not repeat an async subagent's investigation while its job is running. Continue only with unrelated work or wait for the dependency boundary.",
+      "Set handoff=true when this parent should end its current turn after launching; the grouped completion will wake it later. This only takes effect when this is the only terminating tool batch.",
     ],
     parameters: Type.Object({
       tasks: Type.Array(subagentTaskSchema, { minItems: 1, maxItems: 8, description: "Subagent tasks to launch." }),
       deliver: Type.Optional(deliverSchema),
+      handoff: Type.Optional(Type.Boolean({ description: "End the parent turn after launching. Results arrive later through the group's completion notification; this is not a wait." })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const configResult = loadSubagentsConfig(ctx.cwd);
@@ -765,10 +1129,37 @@ export default function (pi: ExtensionAPI) {
         return configErrorResult(fallback, error);
       }
 
+      const explicitIds = tasks
+        .map((task) => normalizeJobTag(task.tag))
+        .filter((id): id is string => Boolean(id));
+      const duplicateIds = [...new Set(explicitIds.filter((id, index) => explicitIds.indexOf(id) !== index))];
+      const existingIds = explicitIds.filter((id) => jobs.has(id));
+      if (duplicateIds.length > 0 || existingIds.length > 0) {
+        const conflicts = [
+          duplicateIds.length > 0 ? `duplicate tags: ${duplicateIds.map((id) => `#${id}`).join(", ")}` : undefined,
+          existingIds.length > 0 ? `already-used tags: ${existingIds.map((id) => `#${id}`).join(", ")}` : undefined,
+        ].filter((line): line is string => line !== undefined).join("; ");
+        const error = `subagents: async batch rejected before launch (${conflicts}).`;
+        const fallback: SubagentInput = { role: "batch validation", task: error, model: "smart", tools: "none" };
+        return configErrorResult(fallback, error);
+      }
+
+      const groupId = makeGroupId();
+      const group: AsyncGroup = {
+        id: groupId,
+        jobIds: [],
+        createdAt: Date.now(),
+        deliver: params.deliver ?? configResult.config.async.defaultDelivery,
+        notified: false,
+        waiters: 0,
+        collectedJobIds: new Set(),
+      };
+      groups.set(groupId, group);
+
       const launched: AsyncJob[] = [];
       const errors: string[] = [];
       for (const task of tasks) {
-        const input = {
+        const input: AsyncLaunchInput = {
           role: task.role ?? "You are a helpful subagent.",
           task: task.task ?? "",
           cwd: task.cwd,
@@ -776,33 +1167,167 @@ export default function (pi: ExtensionAPI) {
           tools: task.tools as SubagentToolPolicy,
           tag: task.tag,
           deliver: params.deliver,
+          groupId,
         };
         const result = launchAsync(input, ctx);
-        if ("abortController" in result) launched.push(result);
-        else errors.push(result.error);
+        if ("abortController" in result) {
+          launched.push(result);
+          group.jobIds.push(result.id);
+        } else {
+          errors.push(result.error);
+        }
       }
 
+      if (launched.length === 0) groups.delete(groupId);
       const lines = [
-        launched.length > 0 ? `Launched ${launched.length} async subagent${launched.length === 1 ? "" : "s"}:` : "No subagents launched.",
+        launched.length > 0 ? `Launched ${launched.length} async subagent${launched.length === 1 ? "" : "s"} in group ${groupId}:` : "No subagents launched.",
         ...launched.map((j) => `- #${j.id} ${j.model} ${j.tools} (${j.deliver})`),
+        launched.length > 0 ? `Use subagents_wait({ groupId: "${groupId}" }) before using these results.` : undefined,
         ...errors.map((e) => `- error: ${e}`),
+      ].filter((line): line is string => line !== undefined);
+      return { content: [{ type: "text" as const, text: lines.join("\n") }], details: { groupId: launched.length > 0 ? groupId : undefined, launched: launched.map(jobDetails), errors }, isError: errors.length > 0, terminate: launched.length > 0 && params.handoff === true };
+    },
+  });
+
+  pi.registerTool({
+    name: "subagents_wait",
+    label: "Wait for Subagents",
+    description: "Wait for selected async subagent jobs to finish and return their results. Use groupId from subagents_async, tags for specific jobs, or all for every active job. This is a real synchronization barrier; it does not cancel children when the wait times out or is aborted.",
+    promptSnippet: "subagents_wait(groupId?, tags?, all?, timeoutMs?) — wait for async results",
+    promptGuidelines: [
+      "Use subagents_wait before beginning work that depends on async subagent results.",
+      "Use groupId from subagents_async to wait for the complete launched batch.",
+      "Do not duplicate an async subagent's investigation while waiting for its result.",
+      "A timeout or aborted wait leaves child jobs running and does not consume the group notification; inspect or wait again rather than launching duplicate replacements.",
+    ],
+    parameters: subagentWaitSchema,
+    async execute(_toolCallId, params, signal): Promise<ExtensionToolResult<SubagentWaitDetails>> {
+      const hasGroup = Boolean(params.groupId?.trim());
+      const hasTags = (params.tags?.length ?? 0) > 0;
+      const hasAll = params.all === true;
+      const selectorCount = Number(hasGroup) + Number(hasTags) + Number(hasAll);
+      if (selectorCount > 1) {
+        return {
+          content: [{ type: "text" as const, text: "Choose exactly one of groupId, tags, or all." }],
+          details: { jobs: [] },
+          isError: true,
+        };
+      }
+      if (selectorCount === 0) {
+        return {
+          content: [{ type: "text" as const, text: "Specify groupId, tags, or all to select async subagent jobs." }],
+          details: { jobs: [] },
+          isError: true,
+        };
+      }
+
+      let selected: AsyncJob[];
+      let selectedGroupId: string | undefined;
+      if (hasGroup) {
+        selectedGroupId = params.groupId!.trim();
+        const group = groups.get(selectedGroupId);
+        if (!group) {
+          return {
+            content: [{ type: "text" as const, text: `No async subagent group ${selectedGroupId}.` }],
+            details: { groupId: selectedGroupId, jobs: [] },
+            isError: true,
+          };
+        }
+        selected = group.jobIds.map((id) => jobs.get(id)).filter((job): job is AsyncJob => Boolean(job));
+      } else if (hasTags) {
+        const ids = [...new Set(params.tags!.map((tag: string) => tag.replace(/^#/, "").trim()).filter(Boolean))];
+        selected = ids.map((id: string) => jobs.get(id)).filter((job): job is AsyncJob => Boolean(job));
+        const missing = ids.filter((id: string) => !jobs.has(id));
+        if (missing.length > 0) {
+          return {
+            content: [{ type: "text" as const, text: `No async subagent job${missing.length === 1 ? "" : "s"}: ${missing.map((id: string) => `#${id}`).join(", ")}.` }],
+            details: { jobs: selected.map(jobDetails) },
+            isError: true,
+          };
+        }
+      } else {
+        selected = Array.from(jobs.values()).filter((job) => job.status === "running");
+      }
+
+      if (selected.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: selectedGroupId ? `Group ${selectedGroupId} has no retained jobs.` : "No active async subagent jobs." }],
+          details: { groupId: selectedGroupId, outcome: "completed" as const, jobs: [] },
+        };
+      }
+
+      // A wait owns notification suppression at the group level while it is
+      // active. Collected job ids are recorded only after the wait returns, so
+      // overlapping waits cannot clear each other's suppression state.
+      const touchedGroups = new Map<string, AsyncGroup>();
+      for (const job of selected) {
+        const group = groups.get(job.groupId);
+        if (group) touchedGroups.set(group.id, group);
+      }
+      for (const group of touchedGroups.values()) group.waiters++;
+
+      const timeoutMs = params.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
+      const outcome = await waitForSubagentJobs(selected, timeoutMs, signal);
+      if (outcome === "completed") {
+        for (const job of selected) {
+          const group = touchedGroups.get(job.groupId);
+          group?.collectedJobIds.add(job.id);
+        }
+      }
+      for (const group of touchedGroups.values()) {
+        group.waiters = Math.max(0, group.waiters - 1);
+        maybeDeliverCompletedGroup(group.id);
+      }
+      const completed = selected.filter((job) => job.status !== "running").length;
+      const scope = selectedGroupId ? `group ${selectedGroupId}` : hasTags ? "selected jobs" : "all active jobs";
+      const lines = [
+        outcome === "completed"
+          ? `Subagent wait completed for ${scope}: ${completed}/${selected.length} finished.`
+          : outcome === "timeout"
+            ? `Subagent wait timed out for ${scope}: ${completed}/${selected.length} finished. Remaining jobs continue running.`
+            : `Subagent wait aborted for ${scope}: ${completed}/${selected.length} finished. Remaining jobs continue running.`,
+        ...selected.map((job) => {
+          const body = job.status === "done" ? job.answer ?? "(subagent returned no text)" : job.error ?? job.answer ?? "No result text.";
+          return [``, `### #${job.id} ${job.status}`, body].join("\n");
+        }),
       ];
-      return { content: [{ type: "text" as const, text: lines.join("\n") }], details: { launched, errors }, isError: errors.length > 0 };
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+        details: { groupId: selectedGroupId, outcome, jobs: selected.map(jobDetails) },
+        isError: outcome === "aborted",
+      };
     },
   });
 
   pi.registerTool({
     name: "subagent_status",
     label: "Subagent Status",
-    description: "Check async subagent job status. Omit tag to list all jobs.",
-    promptSnippet: "subagent_status(tag?) — check async subagent jobs",
-    parameters: Type.Object({ tag: Type.Optional(Type.String({ description: "Job tag/id without leading #." })) }),
-    async execute(_toolCallId, params) {
+    description: "Check async subagent job or group status. Completed results are retained for later subagents_wait calls.",
+    promptSnippet: "subagent_status(tag?, groupId?) — check async subagent jobs",
+    parameters: Type.Object({
+      tag: Type.Optional(Type.String({ description: "Job tag/id without leading #." })),
+      groupId: Type.Optional(Type.String({ description: "Async group id returned by subagents_async." })),
+    }),
+    async execute(_toolCallId, params): Promise<ExtensionToolResult<SubagentStatusDetails>> {
       const tag = params.tag?.replace(/^#/, "");
-      const selected = tag ? [jobs.get(tag)].filter((j): j is AsyncJob => Boolean(j)) : Array.from(jobs.values());
-      if (selected.length === 0) return { content: [{ type: "text" as const, text: tag ? `No async subagent job #${tag}.` : "No async subagent jobs." }], details: { jobs: [] } };
-      const lines = selected.map((j) => `#${j.id} ${j.status} ${j.model} ${j.tools} ${formatElapsed(elapsedMs(j))} ${formatRunUsage(j)}`.trim());
-      return { content: [{ type: "text" as const, text: lines.join("\n") }], details: { jobs: selected.map(({ abortController: _a, ...j }) => j) } };
+      const groupId = params.groupId?.trim();
+      if (tag && groupId) return { content: [{ type: "text" as const, text: "Choose either tag or groupId, not both." }], details: { jobs: [] }, isError: true };
+      if (groupId && !groups.has(groupId)) return { content: [{ type: "text" as const, text: `No async subagent group ${groupId}.` }], details: { groupId, jobs: [] }, isError: true };
+
+      const selected = groupId
+        ? groups.get(groupId)!.jobIds.map((id) => jobs.get(id)).filter((j): j is AsyncJob => Boolean(j))
+        : tag
+          ? [jobs.get(tag)].filter((j): j is AsyncJob => Boolean(j))
+          : Array.from(jobs.values());
+      if (selected.length === 0) {
+        const target = groupId ? `group ${groupId}` : tag ? `job #${tag}` : "jobs";
+        return { content: [{ type: "text" as const, text: `No async subagent ${target}.` }], details: { groupId, jobs: [] } };
+      }
+      const lines = selected.map((j) => {
+        const resultHint = j.status === "done" ? ` — result available via subagents_wait` : "";
+        return `#${j.id} ${j.status} ${j.model} ${j.tools} ${formatElapsed(elapsedMs(j))} ${formatRunUsage(j)}${resultHint}`.trim();
+      });
+      return { content: [{ type: "text" as const, text: lines.join("\n") }], details: { groupId, jobs: selected.map(jobDetails) } };
     },
   });
 
@@ -816,13 +1341,15 @@ export default function (pi: ExtensionAPI) {
       const tag = params.tag.replace(/^#/, "");
       const job = jobs.get(tag);
       if (!job) return { content: [{ type: "text" as const, text: `No async subagent job #${tag}.` }], details: {}, isError: true };
-      if (job.status !== "running") return { content: [{ type: "text" as const, text: `Job #${tag} is already ${job.status}.` }], details: job };
+      if (job.status !== "running") return { content: [{ type: "text" as const, text: `Job #${tag} is already ${job.status}.` }], details: jobDetails(job) };
       job.status = "cancelled";
+      job.abortReason = "cancelled";
       job.endedAt = Date.now();
       job.error = "cancelled by primary agent";
+      settleJobCompletion(job);
       job.abortController.abort();
-      updateWidget(widgetCtx, jobs);
-      return { content: [{ type: "text" as const, text: `Cancelled async subagent #${tag}.` }], details: job };
+      updateWidget(widgetCtx, jobs, groups);
+      return { content: [{ type: "text" as const, text: `Cancelled async subagent #${tag}.` }], details: jobDetails(job) };
     },
   });
 }
