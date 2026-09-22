@@ -96,6 +96,26 @@ describe("subagents widget", () => {
   });
 });
 
+describe("subagent tool policies", () => {
+  it("maps full policy to every built-in coding tool", async () => {
+    const { getSubagentToolNames } = await import("../extensions/subagents");
+
+    expect(getSubagentToolNames("none")).toEqual([]);
+    expect(getSubagentToolNames("read_only")).toEqual(["read", "grep", "find", "ls"]);
+    expect(getSubagentToolNames("full")).toEqual(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+  });
+
+  it("allows full-policy agents to modify and test the codebase", async () => {
+    const { buildSubagentSystemPrompt } = await import("../extensions/subagents");
+    const prompt = buildSubagentSystemPrompt("You are an implementation engineer.", "full");
+
+    expect(prompt).toContain("full built-in Pi coding toolset");
+    expect(prompt).toContain("read, bash, edit, write, grep, find, and ls");
+    expect(prompt).toContain("make code changes and run commands/tests");
+    expect(prompt).not.toContain("Do not make code changes.");
+  });
+});
+
 describe("phase 2 orchestration tools", () => {
   it("registers a synchronous parallel tool and an async wait barrier", async () => {
     const { default: registerSubagents } = await import("../extensions/subagents");

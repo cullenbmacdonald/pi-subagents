@@ -29,13 +29,13 @@ Good uses:
 - review several repos in parallel from a parent workspace directory
 - map unfamiliar code before editing
 - ask for independent role-based review, e.g. backend reviewer, frontend reviewer, migration reviewer
+- delegate implementation and test work with `tools="full"`
 - run independent investigations in the background
 - keep parent-session context focused on decisions and edits
 
 Bad uses:
 
-- making file changes
-- running commands/tests that require bash
+- overlapping write-capable agents in the same files without coordination
 - async work whose result is required before the next step
 - tasks that rely on parent-session memory but do not include the needed context
 
@@ -53,9 +53,9 @@ Arguments:
 |---|---:|---|
 | `role` | yes | Bespoke role/job framing for this subagent |
 | `task` | yes | Self-contained task and all context needed |
-| `cwd` | no | Working directory for `read_only` subagents; defaults to parent cwd |
+| `cwd` | no | Working directory for the subagent; defaults to parent cwd |
 | `model` | yes | Fixed model preset: `fast`, `smart`, or `coder` |
-| `tools` | yes | Tool policy: `none` or `read_only` |
+| `tools` | yes | Tool policy: `none`, `read_only`, or `full` |
 
 Example:
 
@@ -66,6 +66,18 @@ subagent(
   cwd="./payroll-api",
   model="coder",
   tools="read_only"
+)
+```
+
+For implementation work, grant the child the full built-in coding toolset:
+
+```text
+subagent(
+  role="You are a senior engineer implementing the requested change.",
+  task="Implement the feature in this repo, run the relevant tests, and report the files changed and checks run.",
+  cwd="./payroll-api",
+  model="coder",
+  tools="full"
 )
 ```
 
@@ -117,9 +129,9 @@ Each task has:
 | `tag` | no, recommended | Stable async job id, e.g. `payroll-pr-review` |
 | `role` | yes | Bespoke role/job framing |
 | `task` | yes | Self-contained task |
-| `cwd` | no | Working directory for `read_only` subagents |
+| `cwd` | no | Working directory for the subagent |
 | `model` | yes | `fast`, `smart`, or `coder` |
-| `tools` | yes | `none` or `read_only` |
+| `tools` | yes | `none`, `read_only`, or `full` |
 
 Example: review three repos from a parent workspace directory:
 
@@ -236,8 +248,9 @@ Subagents require an explicit tool policy.
 |---|---|---|
 | `none` | no tools | Reasoning over context included in the task |
 | `read_only` | `read`, `grep`, `find`, `ls` | Codebase inspection without mutation |
+| `full` | `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls` | Implementation, command/test execution, and codebase changes |
 
-`read_only` subagents cannot run bash. For PR review, either ask them to inspect files directly or have the parent agent provide diffs in the task. A future policy may add constrained read-only git tools.
+Use `full` when the child should do implementation work or run tests. Write-capable agents share the selected `cwd` with the parent and any other agents, so do not run overlapping tasks against the same files without coordination.
 
 ---
 
@@ -443,7 +456,7 @@ Do not use `subagents_async` for work whose result you immediately need, and do 
 - running/done/error status and retained completion state
 - elapsed time
 - token/cost summary
-- read-only tool-call count
+- tool-call count
 - expandable markdown answer
 
 Async jobs appear in a persistent widget while running. Terminal results remain available through `subagent_status` and `subagents_wait` for the current Pi session:
@@ -470,7 +483,7 @@ Use `subagent`/`subagents_async` aggressively for scoped work.
 - Do not repeat an async subagent's investigation while it is running. Continue only with unrelated work or wait at the dependency boundary.
 - Always provide a bespoke `role` and self-contained `task`.
 - Always choose `model`: `fast`, `smart`, or `coder`.
-- Always choose `tools`: `none` or `read_only`.
+- Always choose `tools`: `none`, `read_only`, or `full`; use `full` when the child should modify files or run commands.
 - Use `fast` for cheap reconnaissance, `smart` for balanced exploration/reasoning, and `coder` for code-heavy review/debugging.
 - Use clear async tags when launching multiple subagents.
 - Set `handoff: true` on `subagents_async` when the parent should end its current turn instead of doing unrelated follow-up work.
@@ -492,7 +505,9 @@ Use `subagent`/`subagents_async` aggressively for scoped work.
 - no prompt templates
 - no context files
 
-Async subagents should stay read-only/reasoning-only. Background write-capable agents are unsafe because the primary agent may edit the same files concurrently.
+`tools="full"` subagents run the same isolated in-process sessions with all built-in Pi coding tools enabled. They can execute commands and modify files in the selected `cwd`; they still do not load extensions, skills, prompt templates, or context files.
+
+Background write-capable agents are allowed, but the primary agent must coordinate shared-file access to avoid conflicting edits.
 
 ---
 

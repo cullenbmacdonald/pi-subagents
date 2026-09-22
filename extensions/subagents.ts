@@ -24,12 +24,14 @@ import { complete, type Context } from "@earendil-works/pi-ai/compat";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 
 type SubagentModelPreset = "fast" | "smart" | "coder";
-type SubagentToolPolicy = "none" | "read_only";
+export type SubagentToolPolicy = "none" | "read_only" | "full";
 type AsyncDelivery = "steer" | "followUp";
 type JobStatus = "running" | "done" | "error" | "aborted" | "cancelled";
 
 const MODEL_PRESETS = ["fast", "smart", "coder"] as const;
-const TOOL_POLICIES = ["none", "read_only"] as const;
+const TOOL_POLICIES = ["none", "read_only", "full"] as const;
+const FULL_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
+const READ_ONLY_TOOL_NAMES = ["read", "grep", "find", "ls"] as const;
 const DELIVERY_OPTIONS = ["steer", "followUp"] as const;
 const WIDGET_KEY = "pi-subagents";
 const DEFAULT_MAX_CONCURRENT_ASYNC = 4;
@@ -153,10 +155,33 @@ const MAX_RETAINED_TERMINAL_JOBS = 100;
 const MAX_RETAINED_GROUPS = 50;
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 
-function buildSystemPrompt(role: string, tools: SubagentToolPolicy): string {
+export function getSubagentToolNames(policy: SubagentToolPolicy): string[] {
+  switch (policy) {
+    case "none": return [];
+    case "read_only": return [...READ_ONLY_TOOL_NAMES];
+    case "full": return [...FULL_TOOL_NAMES];
+  }
+}
+
+export function buildSubagentSystemPrompt(role: string, tools: SubagentToolPolicy): string {
   const toolPolicy = tools === "none"
     ? "You have no tools. Reason only from the task and any context included in it. If the task requires inspecting files that were not provided, say so plainly."
-    : "You have read, grep, find, and ls tools. Use them freely for read-only codebase inspection. You do not have bash, edit, or write tools.";
+    : tools === "read_only"
+      ? "You have read, grep, find, and ls tools. Use them freely for read-only codebase inspection. You do not have bash, edit, or write tools."
+      : "You have the full built-in Pi coding toolset: read, bash, edit, write, grep, find, and ls. Inspect, modify, and test the codebase as needed to complete the task.";
+
+  const rules = [
+    "- You have NO memory of the parent conversation. Treat the task as standalone.",
+    "- Do exactly the assigned task, then stop.",
+    "- Be concise and dense. Your answer goes directly back to the orchestrating agent.",
+    "- If using repo evidence, cite files and line numbers when possible.",
+    "- If the task is unanswerable with your tools/context, say so plainly — do not speculate.",
+  ];
+  if (tools === "full") {
+    rules.push("- You may make code changes and run commands/tests when needed. Do not commit or push unless the task explicitly asks you to.");
+  } else {
+    rules.push("- Do not make code changes.");
+  }
 
   return `You are a subagent spawned by a primary AI coding agent.
 
@@ -167,12 +192,7 @@ Tool policy:
 ${toolPolicy}
 
 Rules:
-- You have NO memory of the parent conversation. Treat the task as standalone.
-- Do exactly the assigned task, then stop.
-- Be concise and dense. Your answer goes directly back to the orchestrating agent.
-- If using repo evidence, cite files and line numbers when possible.
-- If the task is unanswerable with your tools/context, say so plainly — do not speculate.
-- Do not make code changes.`;
+${rules.join("\n")}`;
 }
 
 function expandHome(p: string): string {
@@ -307,7 +327,7 @@ function modelGuidance(): string {
 }
 
 function toolsGuidance(): string {
-  return "Required tool policy: none for reasoning-only; read_only for a fresh Pi agent with read/grep/find/ls.";
+  return "Required tool policy: none for reasoning-only; read_only for read-only inspection; full for the complete built-in Pi coding toolset with bash, edit, and write.";
 }
 
 async function resolveConfiguredModel(ctx: ExtensionContext, preset: SubagentModelPreset): Promise<{ ok: true; provider: string; modelId: string; model: any; apiKey?: string; headers?: Record<string, string>; env?: Record<string, string> } | { ok: false; error: string }> {
@@ -354,7 +374,7 @@ async function runSubagent(input: SubagentInput, execution: "sync" | "async", si
 
   if (input.tools === "none") {
     const context: Context = {
-      systemPrompt: buildSystemPrompt(input.role, input.tools),
+      systemPrompt: buildSubagentSystemPrompt(input.role, input.tools),
       messages: [{ role: "user", content: input.task, timestamp: Date.now() }],
     };
 
@@ -404,7 +424,7 @@ async function runSubagent(input: SubagentInput, execution: "sync" | "async", si
       noPromptTemplates: true,
       noThemes: true,
       noContextFiles: true,
-      systemPrompt: buildSystemPrompt(input.role, input.tools),
+      systemPrompt: buildSubagentSystemPrompt(input.role, input.tools),
     });
     await loader.reload();
     if (signal?.aborted) return { ...run, status: "aborted", endedAt: Date.now(), error: "subagent aborted" };
@@ -421,7 +441,7 @@ async function runSubagent(input: SubagentInput, execution: "sync" | "async", si
       model: resolved.model,
       thinkingLevel: "off",
       modelRuntime,
-      tools: ["read", "grep", "find", "ls"],
+      tools: getSubagentToolNames(input.tools),
       resourceLoader: loader,
       sessionManager: SessionManager.inMemory(),
       settingsManager,
@@ -507,7 +527,7 @@ function renderRun(run: RunResult, expanded: boolean, theme: Theme) {
     text += `\n  ${theme.fg("muted", "role: ")}${theme.fg("dim", summarize(run.role, 100))}`;
     text += `\n  ${theme.fg("muted", "task: ")}${theme.fg("dim", summarize(run.task, 100))}`;
     if (run.status === "running") {
-      const activity = run.tools === "read_only" ? `${run.toolCalls.length} tool calls` : "reasoning";
+      const activity = run.tools === "none" ? "reasoning" : `${run.toolCalls.length} tool calls`;
       text += `\n  ${theme.fg("warning", `running · ${activity}`)}`;
     } else if (run.status === "done") {
       const answer = (run.answer ?? "").split("\n").slice(0, 3).join("\n");
@@ -556,7 +576,7 @@ function formatRunUsage(run: UsageRun): string {
   const parts: string[] = [];
   if (run.tokensIn || run.tokensOut) parts.push(`↑${formatTokens(run.tokensIn)} ↓${formatTokens(run.tokensOut)}`);
   if (run.costUsd) parts.push(formatCost(run.costUsd));
-  if (run.tools === "read_only") parts.push(`${run.toolCalls.length} tools`);
+  if (run.tools !== "none") parts.push(`${run.toolCalls.length} tools`);
   return parts.join(" · ");
 }
 
@@ -718,7 +738,7 @@ export function getSubagentWidgetLines(jobs: Iterable<WidgetJob>): string[] | un
 
   const lines = ["Subagents"];
   for (const job of active) {
-    const activity = job.tools === "read_only" ? `${job.toolCalls.length} tools` : "reasoning";
+    const activity = job.tools === "none" ? "reasoning" : `${job.toolCalls.length} tools`;
     lines.push(`⏳ #${job.id} ${job.model} ${job.tools} ${formatElapsed(elapsedMs(job))} ${activity}`);
   }
   return lines;
@@ -877,7 +897,7 @@ export default function (pi: ExtensionAPI) {
     tag: Type.Optional(Type.String({ description: "Optional stable async job tag, e.g. repo-a-review." })),
     role: Type.String({ description: "Bespoke role/job framing for this subagent, e.g. 'You are a staff backend reviewer focused on API compatibility.'" }),
     task: Type.String({ description: "Self-contained task. Include all context the subagent needs; it has no parent memory." }),
-    cwd: Type.Optional(Type.String({ description: "Working directory for read_only subagents. Relative paths resolve from the parent agent cwd." })),
+    cwd: Type.Optional(Type.String({ description: "Working directory for the subagent. Relative paths resolve from the parent agent cwd." })),
     model: modelSchema,
     tools: toolsSchema,
   });
@@ -897,7 +917,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use subagent for scoped work that benefits from an isolated context and a bespoke role/job.",
       "Every subagent call must choose model: fast, smart, or coder.",
-      "Every subagent call must choose tools: none for reasoning-only, read_only for codebase inspection with read/grep/find/ls.",
+      "Every subagent call must choose tools: none for reasoning-only, read_only for inspection, or full for code changes and the complete built-in Pi toolset.",
       "Pack all necessary context into role/task. The subagent has no memory of this conversation.",
     ],
     parameters: Type.Object({
@@ -1105,7 +1125,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use subagents_async only for work that is genuinely independent of the current task; parallelizable does not mean independent.",
       "Use one task per repo/scope and give each task a clear tag so results can be correlated.",
-      "Every async subagent task must choose model and tools explicitly.",
+      "Every async subagent task must choose model and tools explicitly; use full when the child should make changes or run commands.",
       "If your next action depends on these results, call subagents_wait with the returned groupId before starting that action.",
       "Do not repeat an async subagent's investigation while its job is running. Continue only with unrelated work or wait for the dependency boundary.",
       "Set handoff=true when this parent should end its current turn after launching; the grouped completion will wake it later. This only takes effect when this is the only terminating tool batch.",
